@@ -1,11 +1,16 @@
 import { Router } from 'express';
 import { AuthController } from './controllers/AuthController';
-import { CustomerController } from './controllers/CustomerController';
+import { LeadController } from './controllers/LeadController';
+import { OrderController } from './controllers/OrderController';
 import { requireAuth, requireMasterKey } from './middlewares/auth';
 
 const routes = Router();
 
-routes.post('/api/leads', CustomerController.createLead);
+routes.post('/api/leads/email-confirmation', LeadController.emailConfirmation);
+routes.post('/api/leads/verify-code', LeadController.verifyCode);
+
+routes.post('/api/orders', OrderController.createOrder);
+
 routes.post('/api/auth/login', AuthController.login);
 routes.post('/api/auth/refresh', AuthController.refresh);
 
@@ -18,7 +23,7 @@ routes.get('/api/auth/me', (req, res) => {
 });
 routes.post('/api/auth/logout', AuthController.logout);
 
-routes.get('/api/customers', CustomerController.index);
-routes.patch('/api/customers/:id/erp-status', CustomerController.updateERPStatus);
+routes.get('/api/orders', OrderController.index);
+routes.patch('/api/orders/:id/erp-status', OrderController.updateERPStatus);
 
 export default routes;
