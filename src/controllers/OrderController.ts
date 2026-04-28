@@ -1,27 +1,78 @@
 import { Request, Response } from 'express';
 import db from '../database/connection';
+import { CheckoutRequest } from '../middlewares/checkoutAuth';
+
+const PLAN_PRICES: Record<string, number> = {
+  plano_barba: 9800,
+  plano_black: 11800,
+  plano_premium: 17800,
+};
 
 export const OrderController = {
-  async createOrder(req: Request, res: Response) {
+  async createOrder(req: CheckoutRequest, res: Response) {
     try {
-      const { customerId, plan, additionalEyebrow, paymentType } = req.body;
+      // customerId is extracted server-side from the signed checkout token —
+      // never trusted from the request body.
+      const customerId = req.checkoutCustomerId;
+      const { plan, additionalEyebrow, paymentType } = req.body;
 
       if (!customerId || !plan || !paymentType) {
         return res.status(400).json({ error: 'Missing required payload fields' });
       }
 
-      const [order] = await db('orders').insert({
-        customer_id: customerId,
-        plan,
-        additional_eyebrow: additionalEyebrow || false,
-        payment_type: paymentType,
-        payment_status: 'pending',
-        order_status: 'payment_pending'
-      }).returning('*');
+      // Idempotency check: check if there's already an identical pending order
+      const existingOrder = await db('orders')
+        .where({
+          customer_id: customerId,
+          plan,
+          additional_eyebrow: additionalEyebrow || false,
+          payment_type: paymentType,
+          payment_status: 'pending',
+          order_status: 'payment_pending'
+        })
+        .first();
+
+      if (existingOrder) {
+        return res.status(200).json({
+          message: 'Existing pending order returned',
+          orderId: existingOrder.id
+        });
+      }
+
+      // We need to use a transaction to ensure both order and subscription are created
+      const orderId = await db.transaction(async (trx) => {
+        const [order] = await trx('orders').insert({
+          customer_id: customerId,
+          plan,
+          additional_eyebrow: additionalEyebrow || false,
+          payment_type: paymentType,
+          payment_status: 'pending',
+          order_status: 'payment_pending'
+        }).returning('*');
+
+        const loyaltyMonths = paymentType === 'credit_card' ? 0 : 3;
+        let loyaltyUntil = null;
+        if (loyaltyMonths > 0) {
+          const d = new Date();
+          d.setMonth(d.getMonth() + loyaltyMonths);
+          loyaltyUntil = d;
+        }
+
+        await trx('subscriptions').insert({
+          order_id: order.id,
+          customer_id: customerId,
+          status: 'active',
+          loyalty_months: loyaltyMonths,
+          loyalty_until: loyaltyUntil,
+          payment_status: 'pending',
+        });
+
+        return order.id;
+      });
 
       return res.status(201).json({
         message: 'Order created successfully',
-        orderId: order.id
+        orderId: orderId
       });
     } catch (error) {
       console.error(error);
@@ -35,13 +86,14 @@ export const OrderController = {
 
       let query = db('orders')
         .join('customers', 'orders.customer_id', '=', 'customers.id')
+        .join('plans', 'orders.plan', '=', 'plans.name')
         .select(
           'orders.id as order_id',
           'customers.id as customer_id',
           'customers.name',
           'customers.email',
           'customers.whatsapp as phone',
-          'orders.plan',
+          'plans.label as plan',
           'orders.additional_eyebrow',
           'orders.payment_type',
           'orders.payment_status',

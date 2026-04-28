@@ -1,25 +1,22 @@
 import { Request, Response } from 'express';
 import bcrypt from 'bcrypt';
-import jwt from 'jsonwebtoken';
 import db from '../database/connection';
+import { TokenService } from '../services/TokenService';
 
-const generateAccessToken = (id: string) => {
-  return jwt.sign({ id }, process.env.JWT_ACCESS_SECRET as string, {
-    expiresIn: '1h',
-  });
-};
-
-const generateRefreshToken = (id: string) => {
-  return jwt.sign({ id }, process.env.JWT_REFRESH_SECRET as string, {
-    expiresIn: '7d',
+const setRefreshCookie = (res: Response, token: string) => {
+  res.cookie('refresh_token', token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    maxAge: 7 * 24 * 60 * 60 * 1000,
   });
 };
 
 export const AuthController = {
+  /** POST /api/auth/register — admin only, protected by requireMasterKey */
   async register(req: Request, res: Response) {
     try {
       const { email, password } = req.body;
-
       if (!email || !password) {
         return res.status(400).json({ error: 'Email and password are required' });
       }
@@ -30,11 +27,11 @@ export const AuthController = {
       }
 
       const password_hash = await bcrypt.hash(password, 12);
-
       const [newUser] = await db('users').insert({
         email,
         password_hash,
-      }).returning(['id', 'email']);
+        role: 'admin',
+      }).returning(['id', 'email', 'role']);
 
       return res.status(201).json({ user: newUser });
     } catch (error) {
@@ -43,34 +40,24 @@ export const AuthController = {
     }
   },
 
+  /** POST /api/auth/login — admin login (email + password) */
   async login(req: Request, res: Response) {
     try {
       const { email, password } = req.body;
+      const user = await db('users').where({ email, role: 'admin' }).first();
 
-      const user = await db('users').where({ email }).first();
-
-      if (!user) {
-        return res.status(401).json({ error: 'Invalid credentials' });
-      }
+      if (!user) return res.status(401).json({ error: 'Invalid credentials' });
 
       const isValidPassword = await bcrypt.compare(password, user.password_hash);
+      if (!isValidPassword) return res.status(401).json({ error: 'Invalid credentials' });
 
-      if (!isValidPassword) {
-        return res.status(401).json({ error: 'Invalid credentials' });
-      }
+      const payload = { id: user.id, role: 'admin' as const };
+      const accessToken = TokenService.generateAccessToken(payload);
+      const refreshToken = TokenService.generateRefreshToken(payload);
 
-      const accessToken = generateAccessToken(user.id);
-      const refreshToken = generateRefreshToken(user.id);
-
-      res.cookie('refresh_token', refreshToken, {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax',
-        maxAge: 7 * 24 * 60 * 60 * 1000,
-      });
-
+      setRefreshCookie(res, refreshToken);
       return res.json({
-        user: { id: user.id, email: user.email },
+        user: { id: user.id, email: user.email, role: user.role },
         access_token: accessToken,
       });
     } catch (error) {
@@ -79,37 +66,31 @@ export const AuthController = {
     }
   },
 
+  /** POST /api/auth/refresh */
   async refresh(req: Request, res: Response) {
     try {
       const refreshToken = req.cookies.refresh_token;
+      if (!refreshToken) return res.status(401).json({ error: 'Refresh token not found' });
 
-      if (!refreshToken) {
-        return res.status(401).json({ error: 'Refresh token not found' });
-      }
-
-      jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET as string, async (err: any, decoded: any) => {
-        if (err || !decoded) {
-          return res.status(403).json({ error: 'Invalid refresh token' });
-        }
-
+      try {
+        const decoded = TokenService.verifyRefresh(refreshToken);
         const user = await db('users').where({ id: decoded.id }).first();
+        if (!user) return res.status(404).json({ error: 'User not found' });
 
-        if (!user) {
-          return res.status(404).json({ error: 'User not found' });
-        }
-
-        const newAccessToken = generateAccessToken(user.id);
-
+        const newAccessToken = TokenService.generateAccessToken({ id: user.id, role: user.role });
         return res.json({ access_token: newAccessToken });
-      });
+      } catch {
+        return res.status(403).json({ error: 'Invalid refresh token' });
+      }
     } catch (error) {
       console.error(error);
       return res.status(500).json({ error: 'Internal server error' });
     }
   },
 
-  async logout(req: Request, res: Response) {
+  /** POST /api/auth/logout */
+  async logout(_req: Request, res: Response) {
     res.clearCookie('refresh_token');
     return res.json({ message: 'Logged out successfully' });
-  }
+  },
 };
