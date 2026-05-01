@@ -203,7 +203,7 @@ export const SubscriptionController = {
           );
         }
 
-        const isAutoPaid = subData.status === 'active';
+        const isAutoPaid = (subData as any).status === 'active';
 
         // 5. Cancel current subscription in Celcoin
         if (currentSub.celcoin_subscription_id) {
@@ -244,7 +244,7 @@ export const SubscriptionController = {
           loyalty_until: currentSub.loyalty_until,
           payment_status: isAutoPaid ? 'paid' : 'pending',
           celcoin_subscription_id: subData.subscriptionId,
-          payment_link: subData.paymentLink,
+          payment_link: (subData as any).paymentLink ?? null,
         }).returning('*');
 
         // Update order status if autopaid
@@ -286,8 +286,15 @@ export const SubscriptionController = {
 
       // Se enviou endereço agora, atualiza no banco
       if (address) {
+        const addr = typeof address === 'string' ? JSON.parse(address) : address;
         await db('customers').where({ id: customer.id }).update({
-          address: typeof address === 'string' ? address : JSON.stringify(address),
+          zip_code: addr.zipCode?.replace(/\D/g, '') ?? addr.zip_code,
+          street: addr.street,
+          street_number: addr.number ?? addr.street_number,
+          neighborhood: addr.neighborhood,
+          city: addr.city,
+          state: addr.state,
+          complement: addr.complement ?? null,
           updated_at: new Date()
         });
         // Recarregar customer com o novo endereço
@@ -333,13 +340,27 @@ export const SubscriptionController = {
       const uniqueOrderId = `${order.id}_${Date.now()}`;
 
       // Validação de endereço para Boleto/Pix (obrigatório na Celcoin)
-      if (newPaymentMethod !== 'credit_card' && !customer.address) {
+      if (newPaymentMethod !== 'credit_card' && !customer.zip_code) {
         return res.status(400).json({ error: 'ADDRESS_REQUIRED', message: 'Endereço é obrigatório para pagamento via Boleto ou PIX.' });
       }
 
+      // Build address object for CelcoinService from individual DB columns
+      const customerWithAddress = {
+        ...customer,
+        address: customer.zip_code ? {
+          zipCode: customer.zip_code,
+          street: customer.street,
+          number: customer.street_number,
+          neighborhood: customer.neighborhood,
+          city: customer.city,
+          state: customer.state,
+          complement: customer.complement,
+        } : undefined,
+      };
+
       // 3. Criar nova assinatura na Celcoin
       const subData = await CelcoinService.subscribeWithoutCard(
-        customer,
+        customerWithAddress,
         order.price_cents,
         order.price_cents,
         uniqueOrderId, // Enviamos o ID único em vez do order.id puro

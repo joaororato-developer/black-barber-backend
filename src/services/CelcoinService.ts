@@ -332,34 +332,92 @@ export const CelcoinService = {
   },
 
   /**
-   * Fetches subscription details to get the current payment information (QR Code/Link).
+   * Fetches subscription details + ALL transactions via dedicated /transactions endpoint.
+   * The /subscriptions endpoint only embeds a limited set of transactions; the dedicated
+   * /transactions endpoint with subscriptionGalaxPayIds filter returns the full history.
    */
   async getSubscriptionPaymentInfo(subscriptionId: string) {
     const token = await getAccessToken();
-    const res = await celcoinApi.get(`/subscriptions?galaxPayIds=${subscriptionId}&startAt=0&limit=1`, {
-      headers: authHeaders(token)
-    });
-    
-    const sub = res.data?.Subscriptions?.[0];
+
+    // Fetch subscription metadata and all transactions in parallel
+    const [subRes, trxRes] = await Promise.all([
+      celcoinApi.get(`/subscriptions?galaxPayIds=${subscriptionId}&startAt=0&limit=1`, {
+        headers: authHeaders(token)
+      }),
+      celcoinApi.get(`/transactions?subscriptionGalaxPayIds=${subscriptionId}&startAt=0&limit=100`, {
+        headers: authHeaders(token)
+      }).catch(() => null), // graceful fallback if endpoint unavailable
+    ]);
+
+    const sub = subRes.data?.Subscriptions?.[0];
     if (!sub) {
       throw new Error("Subscription not found in Celcoin");
     }
-    
-    // Find the specifically denied or pending transaction to target the retry
-    const transaction = sub?.Transactions?.find((t: any) => 
-      t.status === 'denied' || t.status === 'notSend' || t.status === 'pending'
-    ) || sub?.Transactions?.[0];
-    
+
+    const pendingStatuses = new Set([
+      'pending', 'pendingBoleto', 'pendingPix', 'pendingCreditCard',
+      'waitingPayment', 'notSend', 'denied', 'waitingBoleto', 'waitingPix',
+    ]);
+    const paidStatuses = new Set([
+      'paid', 'payedBoleto', 'payedPix', 'payedCreditCard', 'confirmed',
+    ]);
+
+    // Prefer dedicated /transactions response (full history); fall back to embedded ones
+    const rawTransactions: any[] =
+      trxRes?.data?.Transactions?.length
+        ? trxRes.data.Transactions
+        : (sub?.Transactions ?? []);
+
+    // Sort: pending first, then by paydayDate desc
+    const sorted = [...rawTransactions].sort((a, b) => {
+      const aPending = pendingStatuses.has(a.status) ? 0 : 1;
+      const bPending = pendingStatuses.has(b.status) ? 0 : 1;
+      if (aPending !== bPending) return aPending - bPending;
+      return new Date(b.paydayDate ?? 0).getTime() - new Date(a.paydayDate ?? 0).getTime();
+    });
+
+    const mapTransaction = (t: any) => ({
+      transactionId: t.galaxPayId?.toString() ?? null,
+      status: t.status,
+      isPending: pendingStatuses.has(t.status),
+      isPaid: paidStatuses.has(t.status),
+      value: t.value,
+      paydayDate: t.paydayDate,
+	  payday: t.payday,
+      boleto: t.Boleto ? {
+        pdf: t.Boleto.pdf,
+        bankLine: t.Boleto.bankLine,
+        paymentPage: t.Boleto.page ?? null,
+      } : null,
+      pix: t.Pix ? {
+        qrCode: t.Pix.qrCode ?? null,
+        paymentLink: t.Pix.paymentLink ?? null,
+      } : null,
+    });
+
+    // All transactions for full history display
+    const allTransactions = sorted.map(mapTransaction);
+
+    // Primary = first pending, for legacy fields
+    const primaryRaw =
+      rawTransactions.find((t: any) => pendingStatuses.has(t.status))
+      ?? rawTransactions[0];
+
     return {
       paymentMethod: sub?.mainPaymentMethodId,
-      status: transaction?.status,
-      transactionId: transaction?.galaxPayId?.toString() ?? null,
+      status: primaryRaw?.status ?? null,
+      transactionId: primaryRaw?.galaxPayId?.toString() ?? null,
       paymentLink: sub?.paymentLink ?? null,
-      boleto: transaction?.Boleto ? {
-        pdf: transaction.Boleto.pdf,
-        bankLine: transaction.Boleto.bankLine,
-        paymentPage: transaction.Boleto.page
-      } : null
+      boleto: primaryRaw?.Boleto ? {
+        pdf: primaryRaw.Boleto.pdf,
+        bankLine: primaryRaw.Boleto.bankLine,
+        paymentPage: primaryRaw.Boleto.page ?? null,
+      } : null,
+      pix: primaryRaw?.Pix ? {
+        qrCode: primaryRaw.Pix.qrCode ?? null,
+        paymentLink: primaryRaw.Pix.paymentLink ?? null,
+      } : null,
+      transactions: allTransactions,
     };
   }
 };
