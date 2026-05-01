@@ -23,7 +23,7 @@ const setRefreshCookie = (res: Response, token: string) => {
 export const LeadController = {
   async emailConfirmation(req: Request, res: Response) {
     try {
-      const { email, isReturning } = req.body;
+      const { email, cpf, isReturning } = req.body;
 
       if (!email) return res.status(400).json({ error: 'E-mail is required' });
 
@@ -31,6 +31,21 @@ export const LeadController = {
         const customer = await db('customers').where({ email }).first();
         if (!customer) {
           return res.status(404).json({ error: 'Não encontramos uma conta com este e-mail.' });
+        }
+      } else {
+        // [NEW] Check for duplicate CPF or Email before proceeding with new registration
+        const cleanCPF = cpf ? cpf.replace(/[^\d]/g, '') : '';
+        const existingCustomer = await db('customers')
+          .where({ email })
+          .orWhere(function() {
+            if (cleanCPF) this.where({ cpf: cleanCPF });
+          })
+          .first();
+
+        if (existingCustomer) {
+          return res.status(409).json({ 
+            error: 'Já existe uma conta vinculada a este CPF ou e-mail. Por favor, realize o login para continuar sua compra.' 
+          });
         }
       }
 

@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import db from '../database/connection';
 import { CheckoutRequest } from '../middlewares/checkoutAuth';
+import { CelcoinService } from '../services/CelcoinService';
 
 export const OrderController = {
   async createOrder(req: CheckoutRequest, res: Response) {
@@ -181,6 +182,92 @@ export const OrderController = {
     } catch (error) {
       console.error(error);
       return res.status(500).json({ error: 'Internal server error' });
+    }
+  },
+
+  async getOrderPaymentInfo(req: Request, res: Response) {
+    try {
+      const { id } = req.params;
+      
+      const order = await db('orders')
+        .join('customers', 'orders.customer_id', '=', 'customers.id')
+        .join('plans', 'orders.plan', '=', 'plans.name')
+        .select(
+          'orders.*',
+          'plans.celcoin_plan_id_pix',
+          'plans.price_cents as plan_price_cents',
+          'customers.name', 'customers.email', 'customers.whatsapp', 'customers.cpf',
+          'customers.zip_code', 'customers.street', 'customers.street_number', 'customers.neighborhood', 'customers.city', 'customers.state'
+        )
+        .where('orders.id', id)
+        .first();
+
+      if (!order) return res.status(404).json({ error: 'Order not found' });
+
+      // IF NO CHARGE ID, CREATE IT NOW (Auto-processing for PIX/Boleto)
+      if (!order.celcoin_charge_id) {
+        if (order.payment_type === 'pix') {
+          return res.status(400).json({ error: 'Pagamento via PIX não é mais suportado para assinaturas.' });
+        }
+
+        if (order.payment_type === 'boleto') {
+          // 1. Register customer in Celcoin
+          await CelcoinService.registerCustomer({
+            id: order.customer_id,
+            name: order.name,
+            cpf: order.cpf,
+            email: order.email,
+            whatsapp: order.whatsapp,
+          });
+
+          // 2. Calc total (order price or plan price)
+          const orderUpsells = await db('order_upsells')
+            .join('upsells', 'order_upsells.upsell_id', '=', 'upsells.id')
+            .where('order_upsells.order_id', order.id)
+            .select('upsells.price_cents');
+          
+          const upsellsTotal = orderUpsells.reduce((sum, u) => sum + u.price_cents, 0);
+          const totalCents = (order.price_cents || order.plan_price_cents) + upsellsTotal;
+
+          let celcoinSubId: string | null = null;
+
+          // BOLETO check address
+          if (!order.zip_code || !order.street || !order.street_number) {
+            return res.status(400).json({ 
+              error: 'Endereço completo é obrigatório para pagamento via boleto.',
+              requiresAddress: true 
+            });
+          }
+
+          const subData = await CelcoinService.subscribeBoleto(
+            order.customer_id,
+            totalCents,
+            order.id,
+            order.celcoin_plan_id_pix // reuse same plan logic or similar
+          );
+          celcoinSubId = subData.subscriptionId;
+
+          if (celcoinSubId) {
+            await db('orders').where({ id: order.id }).update({
+              celcoin_charge_id: celcoinSubId,
+              updated_at: new Date()
+            });
+            order.celcoin_charge_id = celcoinSubId;
+          }
+        } else if (order.payment_type === 'credit_card') {
+          return res.json({ 
+            paymentMethod: 'creditcard', 
+            status: 'pending',
+            message: 'Aguardando dados do cartão'
+          });
+        }
+      }
+
+      const paymentInfo = await CelcoinService.getSubscriptionPaymentInfo(order.celcoin_charge_id!);
+      return res.json(paymentInfo);
+    } catch (error: any) {
+      console.error('[OrderController.getOrderPaymentInfo]', error?.response?.data || error);
+      return res.status(500).json({ error: error?.response?.data?.error?.message || 'Internal server error' });
     }
   }
 };

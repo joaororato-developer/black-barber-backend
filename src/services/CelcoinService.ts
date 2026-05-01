@@ -34,7 +34,7 @@ async function getAccessToken(): Promise<string> {
 
   const response = await celcoinApi.post('/token', {
     grant_type: 'authorization_code',
-    scope: 'customers.read customers.write charges.read charges.write subscriptions.read subscriptions.write',
+    scope: 'customers.read customers.write plans.read plans.write subscriptions.read subscriptions.write transactions.read transactions.write charges.read charges.write',
   }, {
     headers: {
       Authorization: `Basic ${authString}`,
@@ -121,38 +121,6 @@ export const CelcoinService = {
     return res.data;
   },
 
-  /**
-   * Creates a monthly PIX subscription.
-   * - First charge: today (generates QR Code immediately)
-   * - Celcoin generates a new PIX automatically every month
-   *
-   * Returns QR code data for the first payment.
-   * Field path: Subscription.Transactions[0].Pix
-   */
-  async subscribePix(customerId: string, amountInCents: number, orderId: string, quantity = 0, planGalaxPayId?: number) {
-    const token = await getAccessToken();
-
-    const res = await celcoinApi.post('/subscriptions', {
-      myId: `SUB_PIX_${orderId}`,
-      planGalaxPayId,
-      value: amountInCents,
-      quantity,              // 0 = indefinite; 3 = loyalty period (3 months)
-      periodicity: 'monthly',
-      firstPayDayDate: today(),
-      mainPaymentMethodId: 'pix',
-      Customer: { myId: customerId },
-    }, { headers: authHeaders(token) });
-
-    const sub = res.data?.Subscription;
-    const pix = sub?.Transactions?.[0]?.Pix;
-
-    return {
-      subscriptionId: sub?.galaxPayId?.toString() ?? null,
-      qrCodeImage: pix?.image ?? null,    // URL to QR Code image
-      qrCodeText: pix?.qrCode ?? null,    // EMV copy-paste string
-      paymentPage: pix?.page ?? null,
-    };
-  },
 
   /**
    * Creates a monthly Credit Card subscription.
@@ -164,18 +132,17 @@ export const CelcoinService = {
     amountInCents: number,
     orderId: string,
     card: CardData,
-    planGalaxPayId?: number
+    planGalaxPayId?: number,
+    firstAmount?: number
   ) {
     const token = await getAccessToken();
     const expiresAt = parseExpiresAt(card.month, card.year);
 
-    console.log('[CelcoinService.subscribeCreditCard] expiresAt resolved to:', expiresAt);
-
-    const res = await celcoinApi.post('/subscriptions', {
+    const payload: any = {
       myId: `SUB_CC_${orderId}`,
       planGalaxPayId,
       value: amountInCents,
-      quantity: 0,
+      quantity: 0,           // Credit Card always 0 (until canceled)
       periodicity: 'monthly',
       firstPayDayDate: today(),
       mainPaymentMethodId: 'creditcard',
@@ -183,12 +150,25 @@ export const CelcoinService = {
       PaymentMethodCreditCard: {
         Card: {
           number: card.number.replace(/\s/g, ''),
-          holder: card.holderName,   // 'holder', not 'holderName'
+          holder: card.holderName,
           expiresAt,                 // 'YYYY-MM' format
           cvv: card.cvv,
         },
       },
-    }, { headers: authHeaders(token) });
+    };
+
+    // Support for pro-rata: if firstAmount is different from amountInCents
+    if (firstAmount && firstAmount !== amountInCents) {
+      payload.Transactions = [
+        {
+          value: firstAmount,
+          paydayDate: today(),
+          myId: `TRX_UPGRADE_${orderId}`
+        }
+      ];
+    }
+
+    const res = await celcoinApi.post('/subscriptions', payload, { headers: authHeaders(token) });
 
     const sub = res.data?.Subscription;
 
@@ -204,7 +184,7 @@ export const CelcoinService = {
    * Pro-rata logic: the first transaction can have a different value than the recurring one.
    */
   async subscribeWithoutCard(
-    customerId: string,
+    customer: any,
     proRataAmount: number,
     fullAmountInCents: number,
     orderId: string,
@@ -215,19 +195,23 @@ export const CelcoinService = {
 
     const normalizedPaymentMethod = paymentMethodId === 'credit_card' ? 'creditcard' : paymentMethodId;
 
-    // Loyalty rule: PIX and boleto have a 3-month commitment; credit card is indefinite
+    // Loyalty rule: Boleto has a 3-month commitment; credit card is indefinite
     const quantity = normalizedPaymentMethod === 'creditcard' ? 0 : 3;
 
-    const res = await celcoinApi.post('/subscriptions', {
+    const payload: any = {
       myId: `SUB_UPGRADE_${orderId}`,
       planGalaxPayId,
-      value: fullAmountInCents, // Recurring value
+      value: fullAmountInCents,
       quantity,
       periodicity: 'monthly',
       firstPayDayDate: today(),
       mainPaymentMethodId: normalizedPaymentMethod,
-      Customer: { myId: customerId },
-      // Send the first transaction with the pro-rata value
+      Customer: {
+        myId: customer.id,
+        name: customer.name,
+        document: customer.cpf.replace(/\D/g, ''),
+        emails: [customer.email],
+      },
       Transactions: [
         {
           myId: `TR_UPGRADE_1_${orderId}`,
@@ -235,7 +219,22 @@ export const CelcoinService = {
           paydayDate: today()
         }
       ]
-    }, { headers: authHeaders(token) });
+    };
+
+    if (customer.address) {
+      const addr = typeof customer.address === 'string' ? JSON.parse(customer.address) : customer.address;
+      payload.Customer.Address = {
+        zipCode: addr.zipCode.replace(/\D/g, ''),
+        street: addr.street,
+        number: addr.number,
+        neighborhood: addr.neighborhood,
+        city: addr.city,
+        state: addr.state,
+        complement: addr.complement ?? '',
+      };
+    }
+
+    const res = await celcoinApi.post('/subscriptions', payload, { headers: authHeaders(token) });
 
     const sub = res.data?.Subscription;
 
@@ -257,7 +256,7 @@ export const CelcoinService = {
       myId: `SUB_BOLETO_${orderId}`,
       planGalaxPayId,
       value: amountInCents,
-      quantity: 3,           // 3-month loyalty period
+      quantity: 3,           // Boleto/PIX always 3 for loyalty period
       periodicity: 'monthly',
       firstPayDayDate: today(),
       mainPaymentMethodId: 'boleto',
@@ -290,6 +289,49 @@ export const CelcoinService = {
   },
 
   /**
+   * Updates the credit card of an existing subscription.
+   */
+  async updateSubscriptionCard(subscriptionId: string, card: CardData) {
+    const token = await getAccessToken();
+    const expiresAt = parseExpiresAt(card.month, card.year);
+
+    const res = await celcoinApi.put(`/subscriptions/${subscriptionId}/galaxPayId`, {
+      PaymentMethodCreditCard: {
+        Card: {
+          number: card.number.replace(/\s/g, ''),
+          holder: card.holderName,
+          expiresAt,
+          cvv: card.cvv,
+        },
+      },
+    }, { headers: authHeaders(token) });
+
+    return res.data;
+  },
+
+  /**
+   * Updates the credit card of a SPECIFIC failed transaction and triggers a new payment attempt.
+   */
+  async updateTransactionCard(transactionId: string, card: CardData) {
+    const token = await getAccessToken();
+    const expiresAt = parseExpiresAt(card.month, card.year);
+
+    const res = await celcoinApi.put(`/transactions/${transactionId}/galaxPayId`, {
+      paydayDate: today(), // Forces immediate reprocessing
+      PaymentMethodCreditCard: {
+        Card: {
+          number: card.number.replace(/\s/g, ''),
+          holder: card.holderName,
+          expiresAt,
+          cvv: card.cvv,
+        },
+      },
+    }, { headers: authHeaders(token) });
+
+    return res.data;
+  },
+
+  /**
    * Fetches subscription details to get the current payment information (QR Code/Link).
    */
   async getSubscriptionPaymentInfo(subscriptionId: string) {
@@ -303,18 +345,16 @@ export const CelcoinService = {
       throw new Error("Subscription not found in Celcoin");
     }
     
-    // The first transaction in the list is usually the current/latest one.
-    const transaction = sub?.Transactions?.[0];
+    // Find the specifically denied or pending transaction to target the retry
+    const transaction = sub?.Transactions?.find((t: any) => 
+      t.status === 'denied' || t.status === 'notSend' || t.status === 'pending'
+    ) || sub?.Transactions?.[0];
     
     return {
       paymentMethod: sub?.mainPaymentMethodId,
       status: transaction?.status,
+      transactionId: transaction?.galaxPayId?.toString() ?? null,
       paymentLink: sub?.paymentLink ?? null,
-      pix: transaction?.Pix ? {
-        qrCodeImage: transaction.Pix.image,
-        qrCodeText: transaction.Pix.qrCode,
-        paymentPage: transaction.Pix.page
-      } : null,
       boleto: transaction?.Boleto ? {
         pdf: transaction.Boleto.pdf,
         bankLine: transaction.Boleto.bankLine,

@@ -2,6 +2,7 @@ import { Response } from 'express';
 import db from '../database/connection';
 import { AuthRequest } from '../middlewares/auth';
 import { CelcoinService } from '../services/CelcoinService';
+import { CardService } from '../services/CardService';
 
 // Returns rank of plan for downgrade checking
 const PLAN_RANK: Record<string, number> = {
@@ -35,9 +36,9 @@ export const SubscriptionController = {
       const orderIds = subscriptions.map(s => s.order_id);
       const upsellRows = orderIds.length
         ? await db('order_upsells')
-            .join('upsells', 'order_upsells.upsell_id', '=', 'upsells.id')
-            .whereIn('order_upsells.order_id', orderIds)
-            .select('order_upsells.order_id', 'upsells.key', 'upsells.label', 'upsells.price_cents')
+          .join('upsells', 'order_upsells.upsell_id', '=', 'upsells.id')
+          .whereIn('order_upsells.order_id', orderIds)
+          .select('order_upsells.order_id', 'upsells.key', 'upsells.label', 'upsells.price_cents')
         : [];
 
       // Group by order_id
@@ -124,6 +125,10 @@ export const SubscriptionController = {
 
       // Get current plan price for pro-rata calculation
       const currentPlanDB = await db('plans').where({ name: currentSub.plan }).first();
+      if (currentSub.payment_type === 'pix') {
+        return res.status(400).json({ error: 'Assinaturas via PIX não podem mais ser alteradas. Por favor, entre em contato com o suporte para migrar para Cartão de Crédito ou Boleto.' });
+      }
+
       const currentPrice = currentPlanDB.price_cents;
 
       // Resolve upsell for the new order
@@ -131,7 +136,7 @@ export const SubscriptionController = {
       if (newAdditionalEyebrow) {
         eyebrowUpsell = await db('upsells').where({ key: 'additional_eyebrow', active: true }).first();
       }
-      
+
       const newBasePrice = planDB.price_cents;
       const newTotalMonthlyPrice = newBasePrice + (eyebrowUpsell?.price_cents ?? 0);
 
@@ -142,19 +147,19 @@ export const SubscriptionController = {
         const dayOfMonth = today.getDate();
         const daysInMonth = 30; // Standard cycle simplification
         const remainingDays = Math.max(1, daysInMonth - dayOfMonth);
-        
+
         const difference = newTotalMonthlyPrice - currentPrice;
         amountToChargeNow = Math.round(difference * (remainingDays / daysInMonth));
-        
+
         // Ensure minimum value (e.g. 1 BRL) to avoid Celcoin errors on very small amounts
         if (amountToChargeNow < 100) amountToChargeNow = 100;
-        
+
         console.log(`[SubscriptionController.changePlan] Pro-rata upgrade: ${currentPrice} -> ${newTotalMonthlyPrice}. Days remaining: ${remainingDays}. Charging: ${amountToChargeNow}`);
       }
 
       // Determine correct Celcoin Plan ID based on payment type
-      const celcoinPlanId = currentSub.payment_type === 'credit_card' 
-        ? planDB.celcoin_plan_id_credit_card 
+      const celcoinPlanId = currentSub.payment_type === 'credit_card'
+        ? planDB.celcoin_plan_id_credit_card
         : planDB.celcoin_plan_id_pix;
 
       const result = await db.transaction(async (trx) => {
@@ -173,15 +178,32 @@ export const SubscriptionController = {
           await trx('order_upsells').insert({ order_id: newOrder.id, upsell_id: eyebrowUpsell.id });
         }
 
-        // 4. Create new subscription in Celcoin (DO THIS FIRST to ensure it works before cancelling the old one)
-        const subData = await CelcoinService.subscribeWithoutCard(
-          customer.id,
-          amountToChargeNow,
-          newTotalMonthlyPrice,
-          newOrder.id,
-          currentSub.payment_type,
-          celcoinPlanId
-        );
+        // 4. Create new subscription in Celcoin
+        const savedCard = await CardService.getCard(customer.id);
+        let subData;
+
+        if (currentSub.payment_type === 'credit_card' && savedCard) {
+          console.log(`[SubscriptionController.changePlan] Attempting automatic upgrade with saved card for customer ${customer.id}`);
+          subData = await CelcoinService.subscribeCreditCard(
+            customer.id,
+            newTotalMonthlyPrice,
+            newOrder.id,
+            savedCard,
+            celcoinPlanId,
+            amountToChargeNow // Pro-rata for the first month
+          );
+        } else {
+          subData = await CelcoinService.subscribeWithoutCard(
+            customer.id,
+            amountToChargeNow,
+            newTotalMonthlyPrice,
+            newOrder.id,
+            currentSub.payment_type,
+            celcoinPlanId
+          );
+        }
+
+        const isAutoPaid = subData.status === 'active';
 
         // 5. Cancel current subscription in Celcoin
         if (currentSub.celcoin_subscription_id) {
@@ -220,10 +242,18 @@ export const SubscriptionController = {
           status: 'active',
           loyalty_months: currentSub.loyalty_months,
           loyalty_until: currentSub.loyalty_until,
-          payment_status: 'pending',
+          payment_status: isAutoPaid ? 'paid' : 'pending',
           celcoin_subscription_id: subData.subscriptionId,
           payment_link: subData.paymentLink,
         }).returning('*');
+
+        // Update order status if autopaid
+        if (isAutoPaid) {
+          await trx('orders').where({ id: newOrder.id }).update({
+            payment_status: 'paid',
+            order_status: 'registered'
+          });
+        }
 
         return { newOrderId: newOrder.id, newSubId: newSub.id };
       });
@@ -237,6 +267,110 @@ export const SubscriptionController = {
     } catch (error) {
       console.error('[SubscriptionController.changePlan]', error);
       return res.status(500).json({ error: 'Internal server error' });
+    }
+  },
+
+  /** POST /api/customer/subscriptions/:id/change-payment-method */
+  async changePaymentMethod(req: AuthRequest, res: Response) {
+    try {
+      const userId = req.userId;
+      const subscriptionId = req.params.id;
+      const { newPaymentMethod, address } = req.body; // 'credit_card', 'pix', 'boleto', 'address'
+
+      if (!['credit_card', 'pix', 'boleto'].includes(newPaymentMethod)) {
+        return res.status(400).json({ error: 'Método de pagamento inválido.' });
+      }
+
+      let customer = await db('customers').where({ user_id: userId }).first();
+      if (!customer) return res.status(404).json({ error: 'Cliente não encontrado.' });
+
+      // Se enviou endereço agora, atualiza no banco
+      if (address) {
+        await db('customers').where({ id: customer.id }).update({
+          address: typeof address === 'string' ? address : JSON.stringify(address),
+          updated_at: new Date()
+        });
+        // Recarregar customer com o novo endereço
+        customer = await db('customers').where({ id: customer.id }).first();
+      }
+
+      const subscription = await db('subscriptions')
+        .where({ id: subscriptionId, customer_id: customer.id })
+        .first();
+
+      if (!subscription) return res.status(404).json({ error: 'Assinatura não encontrada.' });
+
+      const order = await db('orders').where({ id: subscription.order_id }).first();
+      if (!order) return res.status(404).json({ error: 'Pedido não encontrado.' });
+
+      // Só permite alterar se o pagamento não estiver confirmado
+      if (subscription.payment_status === 'paid' || subscription.payment_status === 'confirmed') {
+        return res.status(400).json({ error: 'Este pagamento já foi confirmado e não pode ser alterado.' });
+      }
+
+      console.log(`[SubscriptionController.changePaymentMethod] Alterando pagamento da sub ${subscriptionId} para ${newPaymentMethod}`);
+
+      // 1. Cancelar assinatura atual na Celcoin
+      if (subscription.celcoin_subscription_id) {
+        try {
+          await CelcoinService.cancelSubscription(subscription.celcoin_subscription_id);
+        } catch (err: any) {
+          console.warn('[SubscriptionController.changePaymentMethod] Falha ao cancelar assinatura antiga na Celcoin:', err.message);
+        }
+      }
+
+      // 2. Buscar o plano para obter os IDs do Celcoin
+      const planDB = await db('plans').where({ name: order.plan }).first();
+      if (!planDB) return res.status(404).json({ error: 'Plano não encontrado no banco de dados.' });
+
+      const celcoinPlanId = newPaymentMethod === 'credit_card'
+        ? planDB.celcoin_plan_id_credit_card
+        : planDB.celcoin_plan_id_pix;
+
+      // --- O SEGREDO ESTÁ AQUI ---
+      // Criamos um identificador único anexando o timestamp. 
+      // Isso engana a Celcoin e permite recriar a assinatura ligada ao mesmo pedido interno.
+      const uniqueOrderId = `${order.id}_${Date.now()}`;
+
+      // Validação de endereço para Boleto/Pix (obrigatório na Celcoin)
+      if (newPaymentMethod !== 'credit_card' && !customer.address) {
+        return res.status(400).json({ error: 'ADDRESS_REQUIRED', message: 'Endereço é obrigatório para pagamento via Boleto ou PIX.' });
+      }
+
+      // 3. Criar nova assinatura na Celcoin
+      const subData = await CelcoinService.subscribeWithoutCard(
+        customer,
+        order.price_cents,
+        order.price_cents,
+        uniqueOrderId, // Enviamos o ID único em vez do order.id puro
+        newPaymentMethod,
+        celcoinPlanId
+      );
+
+      // 4. Atualizar DB
+      await db.transaction(async (trx) => {
+        await trx('orders').where({ id: order.id }).update({
+          payment_type: newPaymentMethod,
+          celcoin_charge_id: subData.subscriptionId, // <-- CORREÇÃO: Necessário para o Webhook achar o pedido depois!
+          updated_at: new Date()
+        });
+
+        await trx('subscriptions').where({ id: subscription.id }).update({
+          celcoin_subscription_id: subData.subscriptionId,
+          payment_link: subData.paymentLink,
+          updated_at: new Date()
+        });
+      });
+
+      return res.json({
+        message: 'Forma de pagamento alterada com sucesso!',
+        paymentMethod: newPaymentMethod,
+        paymentLink: subData.paymentLink
+      });
+
+    } catch (error: any) {
+      console.error('[SubscriptionController.changePaymentMethod]', error?.response?.data || error);
+      return res.status(500).json({ error: 'Erro ao alterar forma de pagamento.' });
     }
   },
 
