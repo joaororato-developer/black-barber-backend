@@ -3,11 +3,13 @@ import db from '../database/connection';
 import { MailService } from '../services/MailService';
 import { TokenService } from '../services/TokenService';
 
+import crypto from 'crypto';
+
 const RATE_LIMIT_MAX_ATTEMPTS = 5;
 const RATE_LIMIT_LOCK_MINUTES = 15;
 const CODE_EXPIRY_MINUTES = 5;
 
-const generateCode = () => Math.floor(100000 + Math.random() * 900000).toString();
+const generateCode = () => crypto.randomInt(100000, 999999).toString();
 
 const setRefreshCookie = (res: Response, token: string) => {
   res.cookie('refresh_token', token, {
@@ -48,6 +50,18 @@ export const CustomerAuthController = {
         );
         return res.status(429).json({
           error: `Muitas tentativas. Aguarde ${remaining} min para tentar novamente.`,
+        });
+      }
+
+      // Check for email flooding (max 3 codes per 15 minutes)
+      const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000);
+      const recentAttempts = await db('email_confirmations')
+        .where({ email, purpose: 'login' })
+        .where('sent_at', '>', fifteenMinutesAgo);
+
+      if (recentAttempts.length >= 3) {
+        return res.status(429).json({
+          error: 'Muitos códigos solicitados. Aguarde 15 minutos antes de solicitar um novo.',
         });
       }
 

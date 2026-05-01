@@ -84,16 +84,39 @@ export const CelcoinService = {
     cpf: string;
     email: string;
     whatsapp: string;
+    address?: {
+      zipCode: string;
+      street: string;
+      number: string;
+      neighborhood: string;
+      city: string;
+      state: string;
+      complement?: string;
+    };
   }) {
     const token = await getAccessToken();
 
-    const res = await celcoinApi.post('/customers', {
+    const payload: Record<string, any> = {
       myId: customer.id,
       name: customer.name,
       document: customer.cpf.replace(/\D/g, ''),
       emails: [customer.email],
       phones: [customer.whatsapp.replace(/\D/g, '')],
-    }, { headers: authHeaders(token) });
+    };
+
+    if (customer.address) {
+      payload.Address = {
+        zipCode: customer.address.zipCode.replace(/\D/g, ''),
+        street: customer.address.street,
+        number: customer.address.number,
+        neighborhood: customer.address.neighborhood,
+        city: customer.address.city,
+        state: customer.address.state,
+        complement: customer.address.complement ?? '',
+      };
+    }
+
+    const res = await celcoinApi.post('/customers', payload, { headers: authHeaders(token) });
 
     return res.data;
   },
@@ -106,13 +129,14 @@ export const CelcoinService = {
    * Returns QR code data for the first payment.
    * Field path: Subscription.Transactions[0].Pix
    */
-  async subscribePix(customerId: string, amountInCents: number, orderId: string) {
+  async subscribePix(customerId: string, amountInCents: number, orderId: string, quantity = 0, planGalaxPayId?: number) {
     const token = await getAccessToken();
 
     const res = await celcoinApi.post('/subscriptions', {
       myId: `SUB_PIX_${orderId}`,
+      planGalaxPayId,
       value: amountInCents,
-      quantity: 0,            // 0 = indefinite (monthly forever until cancelled)
+      quantity,              // 0 = indefinite; 3 = loyalty period (3 months)
       periodicity: 'monthly',
       firstPayDayDate: today(),
       mainPaymentMethodId: 'pix',
@@ -139,7 +163,8 @@ export const CelcoinService = {
     customerId: string,
     amountInCents: number,
     orderId: string,
-    card: CardData
+    card: CardData,
+    planGalaxPayId?: number
   ) {
     const token = await getAccessToken();
     const expiresAt = parseExpiresAt(card.month, card.year);
@@ -148,6 +173,7 @@ export const CelcoinService = {
 
     const res = await celcoinApi.post('/subscriptions', {
       myId: `SUB_CC_${orderId}`,
+      planGalaxPayId,
       value: amountInCents,
       quantity: 0,
       periodicity: 'monthly',
@@ -173,12 +199,90 @@ export const CelcoinService = {
   },
 
   /**
+   * Creates a subscription without providing credit card data.
+   * Used for plan changes — Celcoin returns a payment link to enter card details.
+   * Pro-rata logic: the first transaction can have a different value than the recurring one.
+   */
+  async subscribeWithoutCard(
+    customerId: string,
+    proRataAmount: number,
+    fullAmountInCents: number,
+    orderId: string,
+    paymentMethodId: string,
+    planGalaxPayId?: number
+  ) {
+    const token = await getAccessToken();
+
+    const normalizedPaymentMethod = paymentMethodId === 'credit_card' ? 'creditcard' : paymentMethodId;
+
+    // Loyalty rule: PIX and boleto have a 3-month commitment; credit card is indefinite
+    const quantity = normalizedPaymentMethod === 'creditcard' ? 0 : 3;
+
+    const res = await celcoinApi.post('/subscriptions', {
+      myId: `SUB_UPGRADE_${orderId}`,
+      planGalaxPayId,
+      value: fullAmountInCents, // Recurring value
+      quantity,
+      periodicity: 'monthly',
+      firstPayDayDate: today(),
+      mainPaymentMethodId: normalizedPaymentMethod,
+      Customer: { myId: customerId },
+      // Send the first transaction with the pro-rata value
+      Transactions: [
+        {
+          myId: `TR_UPGRADE_1_${orderId}`,
+          value: proRataAmount,
+          paydayDate: today()
+        }
+      ]
+    }, { headers: authHeaders(token) });
+
+    const sub = res.data?.Subscription;
+
+    return {
+      subscriptionId: sub?.galaxPayId?.toString() ?? null,
+      paymentLink: sub?.paymentLink ?? null,
+    };
+  },
+
+  /**
+   * Creates a monthly Boleto subscription.
+   * Returns boleto PDF, bank line, and payment page from the first transaction.
+   * Field path: Subscription.Transactions[0].Boleto
+   */
+  async subscribeBoleto(customerId: string, amountInCents: number, orderId: string, planGalaxPayId?: number) {
+    const token = await getAccessToken();
+
+    const res = await celcoinApi.post('/subscriptions', {
+      myId: `SUB_BOLETO_${orderId}`,
+      planGalaxPayId,
+      value: amountInCents,
+      quantity: 3,           // 3-month loyalty period
+      periodicity: 'monthly',
+      firstPayDayDate: today(),
+      mainPaymentMethodId: 'boleto',
+      Customer: { myId: customerId },
+    }, { headers: authHeaders(token) });
+
+    const sub = res.data?.Subscription;
+    const boleto = sub?.Transactions?.[0]?.Boleto;
+
+    return {
+      subscriptionId: sub?.galaxPayId?.toString() ?? null,
+      paymentLink: sub?.paymentLink ?? null,
+      boletoPdf: boleto?.pdf ?? null,
+      boletoBankLine: boleto?.bankLine ?? null,
+      boletoPage: boleto?.page ?? null,
+    };
+  },
+
+  /**
    * Cancels a subscription in Celcoin.
    */
   async cancelSubscription(subscriptionId: string) {
     const token = await getAccessToken();
 
-    const res = await celcoinApi.delete(`/subscriptions/${subscriptionId}`, {
+    const res = await celcoinApi.delete(`/subscriptions/${subscriptionId}/galaxPayId`, {
       headers: authHeaders(token),
     });
 
@@ -205,6 +309,7 @@ export const CelcoinService = {
     return {
       paymentMethod: sub?.mainPaymentMethodId,
       status: transaction?.status,
+      paymentLink: sub?.paymentLink ?? null,
       pix: transaction?.Pix ? {
         qrCodeImage: transaction.Pix.image,
         qrCodeText: transaction.Pix.qrCode,

@@ -62,7 +62,7 @@ export const requireMasterKey = (req: Request, res: Response, next: NextFunction
 };
 
 export const requireCelcoinWebhookHash = (req: Request, res: Response, next: NextFunction) => {
-  const incomingHash = req.headers['webhook-hash'] || req.headers['x-webhook-hash'];
+  const incomingHash = req.headers['webhook-hash'] || req.headers['x-webhook-hash'] || req.body['confirmHash'];
   const expectedHash = process.env.CELCOIN_WEBHOOK_HASH;
 
   if (!expectedHash) {

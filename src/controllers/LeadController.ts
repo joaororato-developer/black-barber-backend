@@ -4,11 +4,12 @@ import { isValidCPF, isValidWhatsapp } from '../utils/validators';
 import { MailService } from '../services/MailService';
 import jwt from 'jsonwebtoken';
 import { TokenService } from '../services/TokenService';
+import crypto from 'crypto';
 
 const RATE_LIMIT_MAX_ATTEMPTS = 5;
 const RATE_LIMIT_LOCK_MINUTES = 15;
 
-const generateRandomCode = () => Math.floor(100000 + Math.random() * 900000).toString();
+const generateRandomCode = () => crypto.randomInt(100000, 999999).toString();
 
 const setRefreshCookie = (res: Response, token: string) => {
   res.cookie('refresh_token', token, {
@@ -31,6 +32,18 @@ export const LeadController = {
         if (!customer) {
           return res.status(404).json({ error: 'Não encontramos uma conta com este e-mail.' });
         }
+      }
+
+      // Check for email flooding (max 3 codes per 15 minutes)
+      const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000);
+      const recentAttempts = await db('email_confirmations')
+        .where({ email, purpose: 'checkout' })
+        .where('sent_at', '>', fifteenMinutesAgo);
+
+      if (recentAttempts.length >= 3) {
+        return res.status(429).json({
+          error: 'Muitos códigos solicitados. Aguarde 15 minutos antes de solicitar um novo.',
+        });
       }
 
       const code = generateRandomCode();
@@ -110,7 +123,11 @@ export const LeadController = {
       } else {
         customer = await db('customers').where({ email }).orWhere({ cpf: cleanCPF }).first();
 
-        if (!customer) {
+        if (customer) {
+          if (customer.email !== email) {
+            return res.status(409).json({ error: 'Este CPF já está associado a outro e-mail. Faça login ou use outro CPF.' });
+          }
+        } else {
           // [RN-007] Check if new customer already has an active subscription via another registration
           // (this would be caught later in order creation, but good to check early for returning emails)
 

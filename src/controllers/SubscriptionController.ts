@@ -3,12 +3,6 @@ import db from '../database/connection';
 import { AuthRequest } from '../middlewares/auth';
 import { CelcoinService } from '../services/CelcoinService';
 
-const PLAN_PRICES: Record<string, number> = {
-  plano_barba: 9800,
-  plano_black: 11800,
-  plano_premium: 17800,
-};
-
 // Returns rank of plan for downgrade checking
 const PLAN_RANK: Record<string, number> = {
   plano_barba: 1,
@@ -20,11 +14,9 @@ export const SubscriptionController = {
   /** GET /api/customer/subscriptions */
   async list(req: AuthRequest, res: Response) {
     try {
-      const customerId = req.userId; // user.id (which is not customer.id)
-      
-      // Need to find the customer.id from user.id
+      const customerId = req.userId;
+
       const customer = await db('customers').where({ user_id: customerId }).first();
-      
       if (!customer) {
         return res.status(404).json({ error: 'Customer profile not found for this user.' });
       }
@@ -33,19 +25,41 @@ export const SubscriptionController = {
         .join('orders', 'subscriptions.order_id', '=', 'orders.id')
         .where('subscriptions.customer_id', customer.id)
         .select(
-           'subscriptions.*',
-           'orders.plan',
-           'orders.additional_eyebrow',
-           'orders.payment_type'
+          'subscriptions.*',
+          'orders.plan',
+          'orders.payment_type'
         )
         .orderBy('subscriptions.created_at', 'desc');
 
+      // Batch-load upsells for all fetched orders
+      const orderIds = subscriptions.map(s => s.order_id);
+      const upsellRows = orderIds.length
+        ? await db('order_upsells')
+            .join('upsells', 'order_upsells.upsell_id', '=', 'upsells.id')
+            .whereIn('order_upsells.order_id', orderIds)
+            .select('order_upsells.order_id', 'upsells.key', 'upsells.label', 'upsells.price_cents')
+        : [];
+
+      // Group by order_id
+      const upsellsByOrder: Record<string, { key: string; label: string; price_cents: number }[]> = {};
+      for (const row of upsellRows) {
+        if (!upsellsByOrder[row.order_id]) upsellsByOrder[row.order_id] = [];
+        upsellsByOrder[row.order_id].push({ key: row.key, label: row.label, price_cents: row.price_cents });
+      }
+
+      // Get plan prices
+      const allPlans = await db('plans').select('name', 'price_cents');
+      const planPrices: Record<string, number> = {};
+      allPlans.forEach(p => planPrices[p.name] = p.price_cents);
+
       const mapped = subscriptions.map(sub => {
-         const priceCents = (PLAN_PRICES[sub.plan] || 0) + (sub.additional_eyebrow ? 4000 : 0);
-         return {
-            ...sub,
-            price_cents: priceCents
-         };
+        const orderUpsells = upsellsByOrder[sub.order_id] ?? [];
+        const upsellsTotal = orderUpsells.reduce((sum, u) => sum + u.price_cents, 0);
+        return {
+          ...sub,
+          upsells: orderUpsells,
+          price_cents: (planPrices[sub.plan] || 0) + upsellsTotal,
+        };
       });
 
       return res.json(mapped);
@@ -71,16 +85,15 @@ export const SubscriptionController = {
 
       const currentSub = await db('subscriptions')
         .join('orders', 'subscriptions.order_id', '=', 'orders.id')
-        .where({ 
-          'subscriptions.id': subscriptionId, 
-          'subscriptions.customer_id': customer.id, 
-          'subscriptions.status': 'active' 
+        .where({
+          'subscriptions.id': subscriptionId,
+          'subscriptions.customer_id': customer.id,
+          'subscriptions.status': 'active'
         })
         .select(
-           'subscriptions.*',
-           'orders.plan',
-           'orders.additional_eyebrow',
-           'orders.payment_type'
+          'subscriptions.*',
+          'orders.plan',
+          'orders.payment_type'
         )
         .first();
 
@@ -98,33 +111,88 @@ export const SubscriptionController = {
       const isDowngrade = newRank < currentRank;
 
       if (isDowngrade && currentSub.loyalty_until && new Date(currentSub.loyalty_until) > new Date()) {
-        return res.status(403).json({ 
-          error: 'Não é possível realizar downgrade do plano durante o período de fidelidade. Você apenas pode realizar upgrade para planos superiores.' 
+        return res.status(403).json({
+          error: 'Não é possível realizar downgrade do plano durante o período de fidelidade. Você apenas pode realizar upgrade para planos superiores.'
         });
       }
 
-      // 2. Prorata logic (RN-006)
-      // Only apply discount on upgrade. (To be implemented safely in Celcoin if supported or via a custom initial charge).
-      // Since Celcoin subscriptions don't natively support dynamic first charge based on prorata easily through the same subscription API without a separate charge, 
-      // we will cancel the old one, and create a new one. To truly support prorata, we might need a separate immediate charge 
-      // or to adjust `value` if Celcoin allows different first charge.
-      // Assuming no prorata implementation in this immediate script to keep it safe, but we acknowledge it.
-      // A full prorata would calculate days remaining and subtract from the first month of the new plan.
-      // Here we simply set the new price.
-      
+      // 2. Check the new plan in the database and calculate new price
+      const planDB = await db('plans').where({ name: newPlan }).first();
+      if (!planDB) {
+        return res.status(400).json({ error: 'Plano inválido.' });
+      }
 
+      // Get current plan price for pro-rata calculation
+      const currentPlanDB = await db('plans').where({ name: currentSub.plan }).first();
+      const currentPrice = currentPlanDB.price_cents;
+
+      // Resolve upsell for the new order
+      let eyebrowUpsell: { id: number; price_cents: number } | undefined;
+      if (newAdditionalEyebrow) {
+        eyebrowUpsell = await db('upsells').where({ key: 'additional_eyebrow', active: true }).first();
+      }
+      
+      const newBasePrice = planDB.price_cents;
+      const newTotalMonthlyPrice = newBasePrice + (eyebrowUpsell?.price_cents ?? 0);
+
+      // Pro-rata logic: if upgrade, charge only the difference proportional to remaining days
+      let amountToChargeNow = newTotalMonthlyPrice;
+      if (newTotalMonthlyPrice > currentPrice) {
+        const today = new Date();
+        const dayOfMonth = today.getDate();
+        const daysInMonth = 30; // Standard cycle simplification
+        const remainingDays = Math.max(1, daysInMonth - dayOfMonth);
+        
+        const difference = newTotalMonthlyPrice - currentPrice;
+        amountToChargeNow = Math.round(difference * (remainingDays / daysInMonth));
+        
+        // Ensure minimum value (e.g. 1 BRL) to avoid Celcoin errors on very small amounts
+        if (amountToChargeNow < 100) amountToChargeNow = 100;
+        
+        console.log(`[SubscriptionController.changePlan] Pro-rata upgrade: ${currentPrice} -> ${newTotalMonthlyPrice}. Days remaining: ${remainingDays}. Charging: ${amountToChargeNow}`);
+      }
+
+      // Determine correct Celcoin Plan ID based on payment type
+      const celcoinPlanId = currentSub.payment_type === 'credit_card' 
+        ? planDB.celcoin_plan_id_credit_card 
+        : planDB.celcoin_plan_id_pix;
 
       const result = await db.transaction(async (trx) => {
-        // 3. Cancel current subscription in Celcoin
+        // 3. Create new order
+        const [newOrder] = await trx('orders').insert({
+          customer_id: customer.id,
+          plan: newPlan,
+          payment_type: currentSub.payment_type,
+          payment_status: 'pending',
+          order_status: 'payment_pending',
+          price_cents: amountToChargeNow // Store the actual amount being charged now
+        }).returning('*');
+
+        // Insert upsell if selected
+        if (eyebrowUpsell) {
+          await trx('order_upsells').insert({ order_id: newOrder.id, upsell_id: eyebrowUpsell.id });
+        }
+
+        // 4. Create new subscription in Celcoin (DO THIS FIRST to ensure it works before cancelling the old one)
+        const subData = await CelcoinService.subscribeWithoutCard(
+          customer.id,
+          amountToChargeNow,
+          newTotalMonthlyPrice,
+          newOrder.id,
+          currentSub.payment_type,
+          celcoinPlanId
+        );
+
+        // 5. Cancel current subscription in Celcoin
         if (currentSub.celcoin_subscription_id) {
           try {
             await CelcoinService.cancelSubscription(currentSub.celcoin_subscription_id);
           } catch (err: any) {
-             console.warn('Failed to cancel subscription in Celcoin, proceeding anyway:', err.message);
+            console.warn('Failed to cancel subscription in Celcoin, proceeding anyway:', err.message);
           }
         }
 
-        // 4. Mark old order & subscription as cancelled
+        // 6. Mark old order & subscription as cancelled in DB
         await trx('subscriptions').where({ id: currentSub.id }).update({
           status: 'cancelled',
           cancelled_at: new Date(),
@@ -137,20 +205,15 @@ export const SubscriptionController = {
           updated_at: new Date()
         });
 
-        // 5. Create new order
-        const [newOrder] = await trx('orders').insert({
-          customer_id: customer.id,
-          plan: newPlan,
-          additional_eyebrow: newAdditionalEyebrow || false,
-          payment_type: currentSub.payment_type, // carry over payment type
-          payment_status: 'pending',
-          order_status: 'payment_pending'
-        }).returning('*');
+        // 7. Update new order with celcoin ID
+        if (subData.subscriptionId) {
+          await trx('orders').where({ id: newOrder.id }).update({
+            celcoin_charge_id: subData.subscriptionId,
+            updated_at: new Date()
+          });
+        }
 
-        // 6. Create new subscription
-        // Keep the original loyalty_until if there's still time, or reset depending on business rules.
-        // Rule: Usually new plan = new loyalty, or keep existing. We'll keep existing if longer, or set new.
-        // Let's assume loyalty resets or carries over. We will carry it over if it's longer.
+        // 8. Create new subscription
         const [newSub] = await trx('subscriptions').insert({
           order_id: newOrder.id,
           customer_id: customer.id,
@@ -158,6 +221,8 @@ export const SubscriptionController = {
           loyalty_months: currentSub.loyalty_months,
           loyalty_until: currentSub.loyalty_until,
           payment_status: 'pending',
+          celcoin_subscription_id: subData.subscriptionId,
+          payment_link: subData.paymentLink,
         }).returning('*');
 
         return { newOrderId: newOrder.id, newSubId: newSub.id };
@@ -185,7 +250,9 @@ export const SubscriptionController = {
       if (!customer) return res.status(404).json({ error: 'Customer not found.' });
 
       const subscription = await db('subscriptions')
-        .where({ id: subscriptionId, customer_id: customer.id })
+        .join('orders', 'subscriptions.order_id', '=', 'orders.id')
+        .where({ 'subscriptions.id': subscriptionId, 'subscriptions.customer_id': customer.id })
+        .select('subscriptions.*', 'orders.payment_type')
         .first();
 
       if (!subscription) {
@@ -193,7 +260,14 @@ export const SubscriptionController = {
       }
 
       if (!subscription.celcoin_subscription_id) {
-        return res.status(400).json({ error: 'Nenhum pagamento Celcoin associado a esta assinatura.' });
+        // If it's a credit card or other method that allows retrospective payment, return info based on DB
+        return res.json({
+          paymentMethod: subscription.payment_type === 'credit_card' ? 'creditcard' : subscription.payment_type,
+          status: 'pending',
+          paymentLink: null,
+          pix: null,
+          boleto: null
+        });
       }
 
       const paymentInfo = await CelcoinService.getSubscriptionPaymentInfo(subscription.celcoin_subscription_id);

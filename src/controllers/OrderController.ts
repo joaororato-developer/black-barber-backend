@@ -2,17 +2,9 @@ import { Request, Response } from 'express';
 import db from '../database/connection';
 import { CheckoutRequest } from '../middlewares/checkoutAuth';
 
-const PLAN_PRICES: Record<string, number> = {
-  plano_barba: 9800,
-  plano_black: 11800,
-  plano_premium: 17800,
-};
-
 export const OrderController = {
   async createOrder(req: CheckoutRequest, res: Response) {
     try {
-      // customerId is extracted server-side from the signed checkout token —
-      // never trusted from the request body.
       const customerId = req.checkoutCustomerId;
       const { plan, additionalEyebrow, paymentType } = req.body;
 
@@ -20,35 +12,53 @@ export const OrderController = {
         return res.status(400).json({ error: 'Missing required payload fields' });
       }
 
-      // Idempotency check: check if there's already an identical pending order
+      // Idempotency: check if there's already a pending order for this customer
       const existingOrder = await db('orders')
         .where({
           customer_id: customerId,
-          plan,
-          additional_eyebrow: additionalEyebrow || false,
-          payment_type: paymentType,
           payment_status: 'pending',
           order_status: 'payment_pending'
         })
         .first();
 
       if (existingOrder) {
+        // Update the existing pending order with the new plan/payment selections
+        await db('orders')
+          .where({ id: existingOrder.id })
+          .update({ plan, payment_type: paymentType, updated_at: new Date() });
+
+        // Sync upsells: delete existing and re-insert based on current selection
+        await db('order_upsells').where({ order_id: existingOrder.id }).delete();
+
+        if (additionalEyebrow) {
+          const upsell = await db('upsells').where({ key: 'additional_eyebrow', active: true }).first();
+          if (upsell) {
+            await db('order_upsells').insert({ order_id: existingOrder.id, upsell_id: upsell.id });
+          }
+        }
+
         return res.status(200).json({
-          message: 'Existing pending order returned',
+          message: 'Existing pending order updated and returned',
           orderId: existingOrder.id
         });
       }
 
-      // We need to use a transaction to ensure both order and subscription are created
+      // Create new order + subscription in a single transaction
       const orderId = await db.transaction(async (trx) => {
         const [order] = await trx('orders').insert({
           customer_id: customerId,
           plan,
-          additional_eyebrow: additionalEyebrow || false,
           payment_type: paymentType,
           payment_status: 'pending',
           order_status: 'payment_pending'
         }).returning('*');
+
+        if (additionalEyebrow) {
+          const upsell = await trx('upsells').where({ key: 'additional_eyebrow', active: true }).first();
+          if (upsell) {
+            await trx('order_upsells').insert({ order_id: order.id, upsell_id: upsell.id });
+          }
+        }
 
         const loyaltyMonths = paymentType === 'credit_card' ? 0 : 3;
         let loyaltyUntil = null;
@@ -70,10 +80,7 @@ export const OrderController = {
         return order.id;
       });
 
-      return res.status(201).json({
-        message: 'Order created successfully',
-        orderId: orderId
-      });
+      return res.status(201).json({ message: 'Order created successfully', orderId });
     } catch (error) {
       console.error(error);
       return res.status(500).json({ error: 'Internal server error' });
@@ -94,7 +101,6 @@ export const OrderController = {
           'customers.email',
           'customers.whatsapp as phone',
           'plans.label as plan',
-          'orders.additional_eyebrow',
           'orders.payment_type',
           'orders.payment_status',
           'orders.order_status',
@@ -102,18 +108,11 @@ export const OrderController = {
           'orders.updated_at'
         );
 
-      if (name) {
-        query = query.where('customers.name', 'ilike', `%${name}%`);
-      }
-
+      if (name) query = query.where('customers.name', 'ilike', `%${name}%`);
       if (date) {
         query = query.whereRaw("DATE(orders.created_at AT TIME ZONE 'America/Sao_Paulo') = ?", [date as unknown as Buffer<ArrayBufferLike>]);
       }
-
-      if (paymentStatus && paymentStatus !== 'all') {
-        query = query.where('orders.payment_status', paymentStatus);
-      }
-
+      if (paymentStatus && paymentStatus !== 'all') query = query.where('orders.payment_status', paymentStatus);
       if (erpStatus && erpStatus !== 'all') {
         if (erpStatus === 'pending') {
           query = query.whereIn('orders.order_status', ['pending', 'payment_pending']);
@@ -124,13 +123,29 @@ export const OrderController = {
 
       const orders = await query.orderBy('orders.created_at', 'desc');
 
+      // For each order, load associated upsells in one batch query
+      const orderIds = orders.map(o => o.order_id);
+      const upsellRows = orderIds.length
+        ? await db('order_upsells')
+            .join('upsells', 'order_upsells.upsell_id', '=', 'upsells.id')
+            .whereIn('order_upsells.order_id', orderIds)
+            .select('order_upsells.order_id', 'upsells.key', 'upsells.label')
+        : [];
+
+      // Group upsells by order_id
+      const upsellsByOrder: Record<string, { key: string; label: string }[]> = {};
+      for (const row of upsellRows) {
+        if (!upsellsByOrder[row.order_id]) upsellsByOrder[row.order_id] = [];
+        upsellsByOrder[row.order_id].push({ key: row.key, label: row.label });
+      }
+
       const mappedOrders = orders.map(o => ({
         id: o.order_id,
         name: o.name,
         email: o.email,
         phone: o.phone,
         plan: o.plan,
-        additionalEyebrow: o.additional_eyebrow,
+        upsells: upsellsByOrder[o.order_id] ?? [],
         paymentMethod: o.payment_type,
         paymentStatus: o.payment_status,
         erpStatus: o.order_status === 'payment_pending' || o.order_status === 'pending' ? 'pending' : o.order_status,
