@@ -11,6 +11,29 @@ const PLAN_RANK: Record<string, number> = {
   plano_premium: 3,
 };
 
+async function getNextBillingDate(celcoinSubscriptionId: string): Promise<string> {
+  const info = await CelcoinService.getSubscriptionPaymentInfo(celcoinSubscriptionId);
+  const transactions = info.transactions;
+
+  const pending = transactions.filter((t: any) => t.isPending && t.paydayDate);
+  if (pending.length > 0) {
+    pending.sort((a: any, b: any) => a.paydayDate!.localeCompare(b.paydayDate!));
+    return pending[0].paydayDate!;
+  }
+
+  const paid = transactions.filter((t: any) => t.isPaid && t.paydayDate);
+  if (paid.length > 0) {
+    paid.sort((a: any, b: any) => b.paydayDate!.localeCompare(a.paydayDate!));
+    const latest = new Date(paid[0].paydayDate!);
+    latest.setMonth(latest.getMonth() + 1);
+    return latest.toISOString().split('T')[0];
+  }
+
+  const next = new Date();
+  next.setMonth(next.getMonth() + 1);
+  return next.toISOString().split('T')[0];
+}
+
 export const SubscriptionController = {
   /** GET /api/customer/subscriptions */
   async list(req: AuthRequest, res: Response) {
@@ -106,7 +129,6 @@ export const SubscriptionController = {
         return res.status(403).json({ error: 'Não é possível alterar o plano enquanto houver um pagamento pendente.' });
       }
 
-      // 1. Check Loyalty RN-003 (Downgrade block)
       const currentRank = PLAN_RANK[currentSub.plan] || 0;
       const newRank = PLAN_RANK[newPlan] || 0;
       const isDowngrade = newRank < currentRank;
@@ -115,6 +137,19 @@ export const SubscriptionController = {
         return res.status(403).json({
           error: 'Não é possível realizar downgrade do plano durante o período de fidelidade. Você apenas pode realizar upgrade para planos superiores.'
         });
+      }
+
+      if (currentSub.payment_status === 'error') {
+        return res.status(403).json({ error: 'Não é possível alterar o plano com uma fatura em atraso. Por favor, regularize o pagamento primeiro.' });
+      }
+
+      if (currentSub.celcoin_subscription_id) {
+        const payInfo = await CelcoinService.getSubscriptionPaymentInfo(currentSub.celcoin_subscription_id);
+        const todayStr = new Date().toISOString().split('T')[0];
+        const hasOverdue = payInfo.transactions.some((t: any) => t.isPending && t.paydayDate && t.paydayDate < todayStr);
+        if (hasOverdue) {
+          return res.status(403).json({ error: 'Não é possível alterar o plano com uma fatura em atraso. Por favor, regularize o pagamento primeiro.' });
+        }
       }
 
       // 2. Check the new plan in the database and calculate new price
@@ -140,21 +175,26 @@ export const SubscriptionController = {
       const newBasePrice = planDB.price_cents;
       const newTotalMonthlyPrice = newBasePrice + (eyebrowUpsell?.price_cents ?? 0);
 
-      // Pro-rata logic: if upgrade, charge only the difference proportional to remaining days
-      let amountToChargeNow = newTotalMonthlyPrice;
-      if (newTotalMonthlyPrice > currentPrice) {
-        const today = new Date();
-        const dayOfMonth = today.getDate();
-        const daysInMonth = 30; // Standard cycle simplification
-        const remainingDays = Math.max(1, daysInMonth - dayOfMonth);
+      let amountToChargeNow: number;
+      let firstPayDayDate: string | undefined;
+      let effectiveFrom: string;
 
+      if (isDowngrade) {
+        firstPayDayDate = await getNextBillingDate(currentSub.celcoin_subscription_id!);
+        amountToChargeNow = newTotalMonthlyPrice;
+        effectiveFrom = firstPayDayDate;
+      } else if (newTotalMonthlyPrice > currentPrice) {
+        const todayDate = new Date();
+        const remainingDays = Math.max(1, 30 - todayDate.getDate());
         const difference = newTotalMonthlyPrice - currentPrice;
-        amountToChargeNow = Math.round(difference * (remainingDays / daysInMonth));
-
-        // Ensure minimum value (e.g. 1 BRL) to avoid Celcoin errors on very small amounts
+        amountToChargeNow = Math.round(difference * (remainingDays / 30));
         if (amountToChargeNow < 100) amountToChargeNow = 100;
-
-        console.log(`[SubscriptionController.changePlan] Pro-rata upgrade: ${currentPrice} -> ${newTotalMonthlyPrice}. Days remaining: ${remainingDays}. Charging: ${amountToChargeNow}`);
+        firstPayDayDate = undefined;
+        effectiveFrom = new Date().toISOString().split('T')[0];
+      } else {
+        amountToChargeNow = newTotalMonthlyPrice;
+        firstPayDayDate = undefined;
+        effectiveFrom = new Date().toISOString().split('T')[0];
       }
 
       // Determine correct Celcoin Plan ID based on payment type
@@ -163,14 +203,15 @@ export const SubscriptionController = {
         : planDB.celcoin_plan_id_pix;
 
       const result = await db.transaction(async (trx) => {
-        // 3. Create new order
         const [newOrder] = await trx('orders').insert({
           customer_id: customer.id,
           plan: newPlan,
           payment_type: currentSub.payment_type,
           payment_status: 'pending',
           order_status: 'payment_pending',
-          price_cents: amountToChargeNow // Store the actual amount being charged now
+          price_cents: isDowngrade ? newTotalMonthlyPrice : amountToChargeNow,
+          effective_from: effectiveFrom,
+          effective_until: null,
         }).returning('*');
 
         // Insert upsell if selected
@@ -183,23 +224,24 @@ export const SubscriptionController = {
         let subData;
 
         if (currentSub.payment_type === 'credit_card' && savedCard) {
-          console.log(`[SubscriptionController.changePlan] Attempting automatic upgrade with saved card for customer ${customer.id}`);
           subData = await CelcoinService.subscribeCreditCard(
             customer.id,
             newTotalMonthlyPrice,
             newOrder.id,
             savedCard,
             celcoinPlanId,
-            amountToChargeNow // Pro-rata for the first month
+            isDowngrade ? undefined : amountToChargeNow,
+            firstPayDayDate
           );
         } else {
           subData = await CelcoinService.subscribeWithoutCard(
             customer.id,
-            amountToChargeNow,
+            isDowngrade ? newTotalMonthlyPrice : amountToChargeNow,
             newTotalMonthlyPrice,
             newOrder.id,
             currentSub.payment_type,
-            celcoinPlanId
+            celcoinPlanId,
+            firstPayDayDate
           );
         }
 
@@ -223,6 +265,7 @@ export const SubscriptionController = {
 
         await trx('orders').where({ id: currentSub.order_id }).update({
           order_status: 'cancelled',
+          effective_until: isDowngrade ? firstPayDayDate : new Date().toISOString().split('T')[0],
           status_updated_at: new Date(),
           updated_at: new Date()
         });

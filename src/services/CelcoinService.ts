@@ -133,7 +133,8 @@ export const CelcoinService = {
     orderId: string,
     card: CardData,
     planGalaxPayId?: number,
-    firstAmount?: number
+    firstAmount?: number,
+    firstPayDayDate?: string
   ) {
     const token = await getAccessToken();
     const expiresAt = parseExpiresAt(card.month, card.year);
@@ -142,9 +143,9 @@ export const CelcoinService = {
       myId: `SUB_CC_${orderId}`,
       planGalaxPayId,
       value: amountInCents,
-      quantity: 0,           // Credit Card always 0 (until canceled)
+      quantity: 0,
       periodicity: 'monthly',
-      firstPayDayDate: today(),
+      firstPayDayDate: firstPayDayDate ?? today(),
       mainPaymentMethodId: 'creditcard',
       Customer: { myId: customerId },
       PaymentMethodCreditCard: {
@@ -189,13 +190,13 @@ export const CelcoinService = {
     fullAmountInCents: number,
     orderId: string,
     paymentMethodId: string,
-    planGalaxPayId?: number
+    planGalaxPayId?: number,
+    firstPayDayDate?: string
   ) {
     const token = await getAccessToken();
 
     const normalizedPaymentMethod = paymentMethodId === 'credit_card' ? 'creditcard' : paymentMethodId;
 
-    // Loyalty rule: Boleto has a 3-month commitment; credit card is indefinite
     const quantity = normalizedPaymentMethod === 'creditcard' ? 0 : 3;
 
     const payload: any = {
@@ -204,7 +205,7 @@ export const CelcoinService = {
       value: fullAmountInCents,
       quantity,
       periodicity: 'monthly',
-      firstPayDayDate: today(),
+      firstPayDayDate: firstPayDayDate ?? today(),
       mainPaymentMethodId: normalizedPaymentMethod,
       Customer: {
         myId: customer.id,
@@ -249,16 +250,16 @@ export const CelcoinService = {
    * Returns boleto PDF, bank line, and payment page from the first transaction.
    * Field path: Subscription.Transactions[0].Boleto
    */
-  async subscribeBoleto(customerId: string, amountInCents: number, orderId: string, planGalaxPayId?: number) {
+  async subscribeBoleto(customerId: string, amountInCents: number, orderId: string, planGalaxPayId?: number, firstPayDayDate?: string) {
     const token = await getAccessToken();
 
     const res = await celcoinApi.post('/subscriptions', {
       myId: `SUB_BOLETO_${orderId}`,
       planGalaxPayId,
       value: amountInCents,
-      quantity: 3,           // Boleto/PIX always 3 for loyalty period
+      quantity: 3,
       periodicity: 'monthly',
-      firstPayDayDate: today(),
+      firstPayDayDate: firstPayDayDate ?? today(),
       mainPaymentMethodId: 'boleto',
       Customer: { myId: customerId },
     }, { headers: authHeaders(token) });
