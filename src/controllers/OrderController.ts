@@ -13,6 +13,18 @@ export const OrderController = {
         return res.status(400).json({ error: 'Missing required payload fields' });
       }
 
+      // Security check: Block if user already has an active/pending subscription
+      const activeSubscription = await db('subscriptions')
+        .where({ customer_id: customerId })
+        .andWhere('status', '!=', 'canceled')
+        .first();
+
+      if (activeSubscription) {
+        return res.status(403).json({ 
+          error: 'Você já possui uma assinatura vinculada a esta conta. Para alterar seu plano ou forma de pagamento, acesse o painel "Minha Conta".' 
+        });
+      }
+
       // Idempotency: check if there's already a pending order for this customer
       const existingOrder = await db('orders')
         .where({

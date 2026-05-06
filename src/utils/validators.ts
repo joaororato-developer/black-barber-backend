@@ -32,3 +32,8 @@ export const isValidWhatsapp = (whatsapp: string): boolean => {
   const cleanWpp = whatsapp.replace(/[^\d]/g, '');
   return cleanWpp.length === 10 || cleanWpp.length === 11;
 };
+
+export const isValidEmail = (email: string): boolean => {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(email);
+};

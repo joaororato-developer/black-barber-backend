@@ -1,7 +1,7 @@
 import { Response } from 'express';
 import db from '../database/connection';
 import { AuthRequest } from '../middlewares/auth';
-import { isValidCPF, isValidWhatsapp } from '../utils/validators';
+import { isValidCPF, isValidWhatsapp, isValidEmail } from '../utils/validators';
 import crypto from 'crypto';
 import { MailService } from '../services/MailService';
 
@@ -30,6 +30,7 @@ export const CustomerController = {
       const { newEmail } = req.body;
 
       if (!newEmail) return res.status(400).json({ error: 'Novo e-mail é obrigatório.' });
+      if (!isValidEmail(newEmail)) return res.status(400).json({ error: 'Formato de e-mail inválido.' });
 
       // Check if email is already in use
       const existingEmail = await db('users').where({ email: newEmail }).first();
@@ -87,6 +88,10 @@ export const CustomerController = {
 
         // Mark code as used
         await db('email_confirmations').where({ id: confirmation.id }).update({ status: 'received' });
+      }
+
+      if (email && !isValidEmail(email)) {
+        return res.status(400).json({ error: 'Formato de e-mail inválido.' });
       }
 
       if (cpf && !isValidCPF(cpf)) {

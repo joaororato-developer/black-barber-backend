@@ -52,7 +52,18 @@ async function getAccessToken(): Promise<string> {
 }
 
 function today(): string {
-  return new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+  const date = new Date();
+  const options: Intl.DateTimeFormatOptions = { 
+    timeZone: 'America/Sao_Paulo', 
+    year: 'numeric', 
+    month: '2-digit', 
+    day: '2-digit' 
+  };
+  const parts = new Intl.DateTimeFormat('pt-BR', options).formatToParts(date);
+  const day = parts.find(p => p.type === 'day')?.value;
+  const month = parts.find(p => p.type === 'month')?.value;
+  const year = parts.find(p => p.type === 'year')?.value;
+  return `${year}-${month}-${day}`; // YYYY-MM-DD
 }
 
 function authHeaders(token: string) {

@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import db from '../database/connection';
-import { isValidCPF, isValidWhatsapp } from '../utils/validators';
+import { isValidCPF, isValidWhatsapp, isValidEmail } from '../utils/validators';
 import { MailService } from '../services/MailService';
 import jwt from 'jsonwebtoken';
 import { TokenService } from '../services/TokenService';
@@ -26,6 +26,7 @@ export const LeadController = {
       const { email, cpf, isReturning } = req.body;
 
       if (!email) return res.status(400).json({ error: 'E-mail is required' });
+      if (!isValidEmail(email)) return res.status(400).json({ error: 'Formato de e-mail inválido.' });
 
       if (isReturning) {
         const customer = await db('customers').where({ email }).first();
@@ -33,20 +34,39 @@ export const LeadController = {
           return res.status(404).json({ error: 'Não encontramos uma conta com este e-mail.' });
         }
       } else {
+        if (!cpf) return res.status(400).json({ error: 'CPF é obrigatório.' });
+        if (!isValidCPF(cpf)) return res.status(400).json({ error: 'CPF inválido.' });
+
         // [NEW] Check for duplicate CPF or Email before proceeding with new registration
         const cleanCPF = cpf ? cpf.replace(/[^\d]/g, '') : '';
         const existingCustomer = await db('customers')
           .where({ email })
-          .orWhere(function() {
+          .orWhere(function () {
             if (cleanCPF) this.where({ cpf: cleanCPF });
           })
           .first();
 
         if (existingCustomer) {
-          return res.status(409).json({ 
-            error: 'Já existe uma conta vinculada a este CPF ou e-mail. Por favor, realize o login para continuar sua compra.' 
+          return res.status(409).json({
+            error: 'Já existe uma conta vinculada a este CPF ou e-mail. Por favor, realize o login para continuar sua compra.'
           });
         }
+      }
+
+      // Check for active lock (prevents bypassing via "Resend" button)
+      const locked = await db('email_confirmations')
+        .where({ email, purpose: 'checkout', status: 'pending' })
+        .where('locked_until', '>', new Date())
+        .orderBy('sent_at', 'desc')
+        .first();
+
+      if (locked) {
+        const remaining = Math.ceil(
+          (new Date(locked.locked_until).getTime() - Date.now()) / 60000
+        );
+        return res.status(429).json({
+          error: `Muitas tentativas erradas. Aguarde ${remaining} min para tentar novamente.`,
+        });
       }
 
       // Check for email flooding (max 3 codes per 15 minutes)
@@ -55,7 +75,7 @@ export const LeadController = {
         .where({ email, purpose: 'checkout' })
         .where('sent_at', '>', fifteenMinutesAgo);
 
-      if (recentAttempts.length >= 3) {
+      if (recentAttempts.length >= 5) {
         return res.status(429).json({
           error: 'Muitos códigos solicitados. Aguarde 15 minutos antes de solicitar um novo.',
         });
@@ -124,7 +144,7 @@ export const LeadController = {
 
         await db('email_confirmations').where({ id: confirmation.id }).update(update);
         return res.status(400).json({
-          error: `Código inválido. ${RATE_LIMIT_MAX_ATTEMPTS - newAttempts} tentativa(s) restante(s).`,
+          error: `Código inválido.`,
         });
       }
 
@@ -170,7 +190,8 @@ export const LeadController = {
 
       // [RN-007] Block if customer already has an active subscription
       const activeSubscription = await db('subscriptions')
-        .where({ customer_id: customer.id, status: 'active' })
+        .where('customer_id', customer.id)
+        .andWhere('status', '!=', 'canceled')
         .first();
 
       if (activeSubscription) {

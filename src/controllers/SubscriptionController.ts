@@ -11,6 +11,26 @@ const PLAN_RANK: Record<string, number> = {
   plano_premium: 3,
 };
 
+function getTodayDateStr(): string {
+  const date = new Date();
+  const options: Intl.DateTimeFormatOptions = { timeZone: 'America/Sao_Paulo', year: 'numeric', month: '2-digit', day: '2-digit' };
+  const parts = new Intl.DateTimeFormat('pt-BR', options).formatToParts(date);
+  const day = parts.find(p => p.type === 'day')?.value;
+  const month = parts.find(p => p.type === 'month')?.value;
+  const year = parts.find(p => p.type === 'year')?.value;
+  return `${year}-${month}-${day}`;
+}
+
+function addMonthToDateStr(dateStr: string): string {
+  const [y, m, d] = dateStr.split('-');
+  const date = new Date(Number(y), Number(m) - 1, Number(d));
+  date.setMonth(date.getMonth() + 1);
+  const nextY = date.getFullYear();
+  const nextM = String(date.getMonth() + 1).padStart(2, '0');
+  const nextD = String(date.getDate()).padStart(2, '0');
+  return `${nextY}-${nextM}-${nextD}`;
+}
+
 async function getNextBillingDate(celcoinSubscriptionId: string): Promise<string> {
   const info = await CelcoinService.getSubscriptionPaymentInfo(celcoinSubscriptionId);
   const transactions = info.transactions;
@@ -18,20 +38,16 @@ async function getNextBillingDate(celcoinSubscriptionId: string): Promise<string
   const pending = transactions.filter((t: any) => t.isPending && t.paydayDate);
   if (pending.length > 0) {
     pending.sort((a: any, b: any) => a.paydayDate!.localeCompare(b.paydayDate!));
-    return pending[0].paydayDate!;
+    return pending[0].paydayDate!.substring(0, 10);
   }
 
   const paid = transactions.filter((t: any) => t.isPaid && t.paydayDate);
   if (paid.length > 0) {
     paid.sort((a: any, b: any) => b.paydayDate!.localeCompare(a.paydayDate!));
-    const latest = new Date(paid[0].paydayDate!);
-    latest.setMonth(latest.getMonth() + 1);
-    return latest.toISOString().split('T')[0];
+    return addMonthToDateStr(paid[0].paydayDate!.substring(0, 10));
   }
 
-  const next = new Date();
-  next.setMonth(next.getMonth() + 1);
-  return next.toISOString().split('T')[0];
+  return addMonthToDateStr(getTodayDateStr());
 }
 
 export const SubscriptionController = {
@@ -145,7 +161,7 @@ export const SubscriptionController = {
 
       if (currentSub.celcoin_subscription_id) {
         const payInfo = await CelcoinService.getSubscriptionPaymentInfo(currentSub.celcoin_subscription_id);
-        const todayStr = new Date().toISOString().split('T')[0];
+        const todayStr = getTodayDateStr();
         const hasOverdue = payInfo.transactions.some((t: any) => t.isPending && t.paydayDate && t.paydayDate < todayStr);
         if (hasOverdue) {
           return res.status(403).json({ error: 'Não é possível alterar o plano com uma fatura em atraso. Por favor, regularize o pagamento primeiro.' });
@@ -184,17 +200,36 @@ export const SubscriptionController = {
         amountToChargeNow = newTotalMonthlyPrice;
         effectiveFrom = firstPayDayDate;
       } else if (newTotalMonthlyPrice > currentPrice) {
+        const nextBillingStr = await getNextBillingDate(currentSub.celcoin_subscription_id!);
+        const [nextY, nextM, nextD] = nextBillingStr.split('-');
+        const nextBilling = new Date(Number(nextY), Number(nextM) - 1, Number(nextD));
+        
         const todayDate = new Date();
-        const remainingDays = Math.max(1, 30 - todayDate.getDate());
+        const todayOnly = new Date(todayDate.getFullYear(), todayDate.getMonth(), todayDate.getDate());
+        
+        const diffTime = nextBilling.getTime() - todayOnly.getTime();
+        let remainingDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+        
+        // Normalize month to 30 days
+        const daysInCurrentMonth = new Date(todayDate.getFullYear(), todayDate.getMonth() + 1, 0).getDate();
+        if (daysInCurrentMonth === 31) {
+          remainingDays -= 1;
+        } else if (daysInCurrentMonth < 30) {
+          remainingDays += (30 - daysInCurrentMonth);
+        }
+        
+        if (remainingDays <= 0) remainingDays = 1;
+
         const difference = newTotalMonthlyPrice - currentPrice;
         amountToChargeNow = Math.round(difference * (remainingDays / 30));
         if (amountToChargeNow < 100) amountToChargeNow = 100;
-        firstPayDayDate = undefined;
-        effectiveFrom = new Date().toISOString().split('T')[0];
+        
+        firstPayDayDate = getTodayDateStr(); // Must be today so Celcoin accepts the immediate pro-rata transaction
+        effectiveFrom = getTodayDateStr();
       } else {
         amountToChargeNow = newTotalMonthlyPrice;
-        firstPayDayDate = undefined;
-        effectiveFrom = new Date().toISOString().split('T')[0];
+        firstPayDayDate = getTodayDateStr();
+        effectiveFrom = getTodayDateStr();
       }
 
       // Determine correct Celcoin Plan ID based on payment type
@@ -235,7 +270,7 @@ export const SubscriptionController = {
           );
         } else {
           subData = await CelcoinService.subscribeWithoutCard(
-            customer.id,
+            customer,
             isDowngrade ? newTotalMonthlyPrice : amountToChargeNow,
             newTotalMonthlyPrice,
             newOrder.id,

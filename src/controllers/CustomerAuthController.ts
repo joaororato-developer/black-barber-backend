@@ -59,7 +59,7 @@ export const CustomerAuthController = {
         .where({ email, purpose: 'login' })
         .where('sent_at', '>', fifteenMinutesAgo);
 
-      if (recentAttempts.length >= 3) {
+      if (recentAttempts.length >= 5) {
         return res.status(429).json({
           error: 'Muitos códigos solicitados. Aguarde 15 minutos antes de solicitar um novo.',
         });
@@ -130,7 +130,7 @@ export const CustomerAuthController = {
 
         await db('email_confirmations').where({ id: confirmation.id }).update(update);
         return res.status(400).json({
-          error: `Código inválido. ${RATE_LIMIT_MAX_ATTEMPTS - newAttempts} tentativa(s) restante(s).`,
+          error: `Código inválido.`,
         });
       }
 
