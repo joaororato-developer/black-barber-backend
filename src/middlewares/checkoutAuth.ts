@@ -7,10 +7,6 @@ export interface CheckoutRequest extends Request {
   checkoutCustomerId?: string;
 }
 
-/**
- * Validates the short-lived checkout token issued after email verification OR a valid Bearer token.
- * Extracts customerId from the token and attaches it to req.checkoutCustomerId.
- */
 export const requireCheckoutToken = async (
   req: CheckoutRequest,
   res: Response,

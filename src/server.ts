@@ -25,6 +25,4 @@ app.use(routes);
 
 const PORT = process.env.PORT || 3333;
 
-app.listen(PORT, () => {
-  console.log(`Backend Server is running in ${process.env.NODE_ENV} mode securely on port ${PORT} `);
-});
+app.listen(PORT);

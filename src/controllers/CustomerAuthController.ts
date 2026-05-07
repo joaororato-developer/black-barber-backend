@@ -21,23 +21,16 @@ const setRefreshCookie = (res: Response, token: string) => {
 };
 
 export const CustomerAuthController = {
-  /**
-   * POST /api/customer/auth/send-code
-   * Sends a 6-digit OTP to the customer's e-mail for login.
-   * Reuses the same email_confirmations table with purpose='login'.
-   */
   async sendCode(req: Request, res: Response) {
     try {
       const { email } = req.body;
       if (!email) return res.status(400).json({ error: 'E-mail é obrigatório.' });
 
-      // Customer must already exist
       const customer = await db('customers').where({ email }).first();
       if (!customer) {
         return res.status(404).json({ error: 'Nenhuma conta encontrada com este e-mail.' });
       }
 
-      // Check for active lock (RN-008)
       const locked = await db('email_confirmations')
         .where({ email, purpose: 'login', status: 'pending' })
         .where('locked_until', '>', new Date())
@@ -53,7 +46,6 @@ export const CustomerAuthController = {
         });
       }
 
-      // Check for email flooding (max 3 codes per 15 minutes)
       const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000);
       const recentAttempts = await db('email_confirmations')
         .where({ email, purpose: 'login' })
@@ -79,22 +71,15 @@ export const CustomerAuthController = {
 
       return res.json({ message: 'Código enviado para o seu e-mail.' });
     } catch (error) {
-      console.error('[CustomerAuth.sendCode]', error);
       return res.status(500).json({ error: 'Erro interno.' });
     }
   },
 
-  /**
-   * POST /api/customer/auth/verify-code
-   * Validates OTP, returns access_token + refresh_token for the customer.
-   * Enforces rate limiting: 5 wrong attempts = 15 min lock (RN-008).
-   */
   async verifyCode(req: Request, res: Response) {
     try {
       const { email, code } = req.body;
       if (!email || !code) return res.status(400).json({ error: 'E-mail e código são obrigatórios.' });
 
-      // Find the most recent pending confirmation for login
       const confirmation = await db('email_confirmations')
         .where({ email, purpose: 'login', status: 'pending' })
         .where('expires_at', '>', new Date())
@@ -105,7 +90,6 @@ export const CustomerAuthController = {
         return res.status(400).json({ error: 'Código expirado. Solicite um novo.' });
       }
 
-      // Check lock
       if (confirmation.locked_until && new Date(confirmation.locked_until) > new Date()) {
         const remaining = Math.ceil(
           (new Date(confirmation.locked_until).getTime() - Date.now()) / 60000
@@ -115,7 +99,6 @@ export const CustomerAuthController = {
         });
       }
 
-      // Wrong code
       if (confirmation.code !== code) {
         const newAttempts = (confirmation.attempts || 0) + 1;
         const update: Record<string, any> = { attempts: newAttempts };
@@ -134,17 +117,14 @@ export const CustomerAuthController = {
         });
       }
 
-      // Valid code — mark as used
       await db('email_confirmations').where({ id: confirmation.id }).update({ status: 'received' });
 
-      // Get customer + linked user
       const customer = await db('customers').where({ email }).first();
       if (!customer) return res.status(404).json({ error: 'Cliente não encontrado.' });
 
       const user = await db('users').where({ id: customer.user_id }).first();
       if (!user) return res.status(404).json({ error: 'Usuário não encontrado.' });
 
-      // Generate tokens
       const payload = { id: user.id, role: 'customer' as const };
       const accessToken = TokenService.generateAccessToken(payload);
       const refreshToken = TokenService.generateRefreshToken(payload);
@@ -162,7 +142,6 @@ export const CustomerAuthController = {
         },
       });
     } catch (error) {
-      console.error('[CustomerAuth.verifyCode]', error);
       return res.status(500).json({ error: 'Erro interno.' });
     }
   },

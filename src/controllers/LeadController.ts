@@ -37,7 +37,6 @@ export const LeadController = {
         if (!cpf) return res.status(400).json({ error: 'CPF é obrigatório.' });
         if (!isValidCPF(cpf)) return res.status(400).json({ error: 'CPF inválido.' });
 
-        // [NEW] Check for duplicate CPF or Email before proceeding with new registration
         const cleanCPF = cpf ? cpf.replace(/[^\d]/g, '') : '';
         const existingCustomer = await db('customers')
           .where({ email })
@@ -53,7 +52,6 @@ export const LeadController = {
         }
       }
 
-      // Check for active lock (prevents bypassing via "Resend" button)
       const locked = await db('email_confirmations')
         .where({ email, purpose: 'checkout', status: 'pending' })
         .where('locked_until', '>', new Date())
@@ -69,7 +67,6 @@ export const LeadController = {
         });
       }
 
-      // Check for email flooding (max 3 codes per 15 minutes)
       const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000);
       const recentAttempts = await db('email_confirmations')
         .where({ email, purpose: 'checkout' })
@@ -95,7 +92,6 @@ export const LeadController = {
 
       return res.status(200).json({ message: 'Confirmation code sent' });
     } catch (error) {
-      console.error(error);
       return res.status(500).json({ error: 'Internal server error' });
     }
   },
@@ -114,7 +110,6 @@ export const LeadController = {
 
       const cleanCPF = cpf ? cpf.replace(/[^\d]/g, '') : '';
 
-      // Find most recent pending checkout confirmation
       const confirmation = await db('email_confirmations')
         .where({ email, purpose: 'checkout', status: 'pending' })
         .andWhere('expires_at', '>', new Date())
@@ -123,13 +118,11 @@ export const LeadController = {
 
       if (!confirmation) return res.status(400).json({ error: 'Código inválido ou expirado.' });
 
-      // Check lock (RN-008)
       if (confirmation.locked_until && new Date(confirmation.locked_until) > new Date()) {
         const remaining = Math.ceil((new Date(confirmation.locked_until).getTime() - Date.now()) / 60000);
         return res.status(429).json({ error: `Muitas tentativas. Aguarde ${remaining} min.` });
       }
 
-      // Wrong code
       if (confirmation.code !== code) {
         const newAttempts = (confirmation.attempts || 0) + 1;
         const update: Record<string, any> = { attempts: newAttempts };
@@ -163,10 +156,6 @@ export const LeadController = {
             return res.status(409).json({ error: 'Este CPF já está associado a outro e-mail. Faça login ou use outro CPF.' });
           }
         } else {
-          // [RN-007] Check if new customer already has an active subscription via another registration
-          // (this would be caught later in order creation, but good to check early for returning emails)
-
-          // Create customer + user atomically
           const [newCustomer] = await db('customers').insert({
             name,
             email,
@@ -175,20 +164,17 @@ export const LeadController = {
           }).returning('*');
           customer = newCustomer;
 
-          // Create a user account (no password — customer logins are OTP-based)
           const [newUser] = await db('users').insert({
             email,
-            password_hash: '', // No password for customer role
+            password_hash: '',
             role: 'customer',
           }).returning('*');
 
-          // Link user ↔ customer
           await db('customers').where({ id: customer.id }).update({ user_id: newUser.id });
           customer.user_id = newUser.id;
         }
       }
 
-      // [RN-007] Block if customer already has an active subscription
       const activeSubscription = await db('subscriptions')
         .where('customer_id', customer.id)
         .andWhere('status', '!=', 'canceled')
@@ -201,14 +187,12 @@ export const LeadController = {
         });
       }
 
-      // Sign short-lived checkout token
       const checkoutToken = jwt.sign(
         { customerId: customer.id },
         process.env.CHECKOUT_TOKEN_SECRET as string,
         { expiresIn: '2h' }
       );
 
-      // Also issue full auth tokens so the customer stays logged in after checkout [RF-010]
       let accessToken: string | null = null;
       let refreshToken: string | null = null;
 
@@ -232,7 +216,6 @@ export const LeadController = {
         } : null,
       });
     } catch (error: any) {
-      console.error(error);
       if (error.code === '23505') {
         return res.status(400).json({ error: 'E-mail ou CPF já cadastrados por outro usuário.' });
       }

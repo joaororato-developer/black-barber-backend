@@ -13,19 +13,17 @@ export const OrderController = {
         return res.status(400).json({ error: 'Missing required payload fields' });
       }
 
-      // Security check: Block if user already has an active/pending subscription
       const activeSubscription = await db('subscriptions')
         .where({ customer_id: customerId })
         .andWhere('status', '!=', 'canceled')
         .first();
 
       if (activeSubscription) {
-        return res.status(403).json({ 
-          error: 'Você já possui uma assinatura vinculada a esta conta. Para alterar seu plano ou forma de pagamento, acesse o painel "Minha Conta".' 
+        return res.status(403).json({
+          error: 'Você já possui uma assinatura vinculada a esta conta. Para alterar seu plano ou forma de pagamento, acesse o painel "Minha Conta".'
         });
       }
 
-      // Idempotency: check if there's already a pending order for this customer
       const existingOrder = await db('orders')
         .where({
           customer_id: customerId,
@@ -35,12 +33,10 @@ export const OrderController = {
         .first();
 
       if (existingOrder) {
-        // Update the existing pending order with the new plan/payment selections
         await db('orders')
           .where({ id: existingOrder.id })
           .update({ plan, payment_type: paymentType, updated_at: new Date() });
 
-        // Sync upsells: delete existing and re-insert based on current selection
         await db('order_upsells').where({ order_id: existingOrder.id }).delete();
 
         if (additionalEyebrow) {
@@ -56,7 +52,6 @@ export const OrderController = {
         });
       }
 
-      // Create new order + subscription in a single transaction
       const orderId = await db.transaction(async (trx) => {
         const [order] = await trx('orders').insert({
           customer_id: customerId,
@@ -95,7 +90,6 @@ export const OrderController = {
 
       return res.status(201).json({ message: 'Order created successfully', orderId });
     } catch (error) {
-      console.error(error);
       return res.status(500).json({ error: 'Internal server error' });
     }
   },
@@ -136,7 +130,6 @@ export const OrderController = {
 
       const orders = await query.orderBy('orders.created_at', 'desc');
 
-      // For each order, load associated upsells in one batch query
       const orderIds = orders.map(o => o.order_id);
       const upsellRows = orderIds.length
         ? await db('order_upsells')
@@ -145,7 +138,6 @@ export const OrderController = {
             .select('order_upsells.order_id', 'upsells.key', 'upsells.label')
         : [];
 
-      // Group upsells by order_id
       const upsellsByOrder: Record<string, { key: string; label: string }[]> = {};
       for (const row of upsellRows) {
         if (!upsellsByOrder[row.order_id]) upsellsByOrder[row.order_id] = [];
@@ -168,7 +160,6 @@ export const OrderController = {
 
       return res.json(mappedOrders);
     } catch (error) {
-      console.error(error);
       return res.status(500).json({ error: 'Internal server error' });
     }
   },
@@ -192,7 +183,6 @@ export const OrderController = {
 
       return res.json({ message: 'ERP status updated properly' });
     } catch (error) {
-      console.error(error);
       return res.status(500).json({ error: 'Internal server error' });
     }
   },
@@ -200,7 +190,7 @@ export const OrderController = {
   async getOrderPaymentInfo(req: Request, res: Response) {
     try {
       const { id } = req.params;
-      
+
       const order = await db('orders')
         .join('customers', 'orders.customer_id', '=', 'customers.id')
         .join('plans', 'orders.plan', '=', 'plans.name')
@@ -216,14 +206,12 @@ export const OrderController = {
 
       if (!order) return res.status(404).json({ error: 'Order not found' });
 
-      // IF NO CHARGE ID, CREATE IT NOW (Auto-processing for PIX/Boleto)
       if (!order.celcoin_charge_id) {
         if (order.payment_type === 'pix') {
           return res.status(400).json({ error: 'Pagamento via PIX não é mais suportado para assinaturas.' });
         }
 
         if (order.payment_type === 'boleto') {
-          // 1. Register customer in Celcoin
           await CelcoinService.registerCustomer({
             id: order.customer_id,
             name: order.name,
@@ -232,22 +220,20 @@ export const OrderController = {
             whatsapp: order.whatsapp,
           });
 
-          // 2. Calc total (order price or plan price)
           const orderUpsells = await db('order_upsells')
             .join('upsells', 'order_upsells.upsell_id', '=', 'upsells.id')
             .where('order_upsells.order_id', order.id)
             .select('upsells.price_cents');
-          
+
           const upsellsTotal = orderUpsells.reduce((sum, u) => sum + u.price_cents, 0);
           const totalCents = (order.price_cents || order.plan_price_cents) + upsellsTotal;
 
           let celcoinSubId: string | null = null;
 
-          // BOLETO check address
           if (!order.zip_code || !order.street || !order.street_number) {
-            return res.status(400).json({ 
+            return res.status(400).json({
               error: 'Endereço completo é obrigatório para pagamento via boleto.',
-              requiresAddress: true 
+              requiresAddress: true
             });
           }
 
@@ -255,7 +241,7 @@ export const OrderController = {
             order.customer_id,
             totalCents,
             order.id,
-            order.celcoin_plan_id_pix // reuse same plan logic or similar
+            order.celcoin_plan_id_pix
           );
           celcoinSubId = subData.subscriptionId;
 
@@ -267,8 +253,8 @@ export const OrderController = {
             order.celcoin_charge_id = celcoinSubId;
           }
         } else if (order.payment_type === 'credit_card') {
-          return res.json({ 
-            paymentMethod: 'creditcard', 
+          return res.json({
+            paymentMethod: 'creditcard',
             status: 'pending',
             message: 'Aguardando dados do cartão'
           });
@@ -278,7 +264,6 @@ export const OrderController = {
       const paymentInfo = await CelcoinService.getSubscriptionPaymentInfo(order.celcoin_charge_id!);
       return res.json(paymentInfo);
     } catch (error: any) {
-      console.error('[OrderController.getOrderPaymentInfo]', error?.response?.data || error);
       return res.status(500).json({ error: error?.response?.data?.error?.message || 'Internal server error' });
     }
   }

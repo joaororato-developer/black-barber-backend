@@ -19,10 +19,6 @@ const celcoinApi = axios.create({
   baseURL: process.env.CELCOIN_URL,
 });
 
-/**
- * Obtains a bearer token using Basic Auth (GalaxId:GalaxHash).
- * Tokens last 600s — cached with a 30s safety buffer.
- */
 async function getAccessToken(): Promise<string> {
   if (tokenCache && Date.now() < tokenCache.expiresAt) {
     return tokenCache.access_token;
@@ -53,26 +49,23 @@ async function getAccessToken(): Promise<string> {
 
 function today(): string {
   const date = new Date();
-  const options: Intl.DateTimeFormatOptions = { 
-    timeZone: 'America/Sao_Paulo', 
-    year: 'numeric', 
-    month: '2-digit', 
-    day: '2-digit' 
+  const options: Intl.DateTimeFormatOptions = {
+    timeZone: 'America/Sao_Paulo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
   };
   const parts = new Intl.DateTimeFormat('pt-BR', options).formatToParts(date);
   const day = parts.find(p => p.type === 'day')?.value;
   const month = parts.find(p => p.type === 'month')?.value;
   const year = parts.find(p => p.type === 'year')?.value;
-  return `${year}-${month}-${day}`; // YYYY-MM-DD
+  return `${year}-${month}-${day}`;
 }
 
 function authHeaders(token: string) {
   return { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
 }
 
-/**
- * Normalizes MM/YY or MM+YYYY into the 'YYYY-MM' format required by Celcoin.
- */
 function parseExpiresAt(month: string, year: string): string {
   const raw = month.trim();
   if (raw.includes('/')) {
@@ -85,10 +78,6 @@ function parseExpiresAt(month: string, year: string): string {
 }
 
 export const CelcoinService = {
-  /**
-   * Registers or updates a customer in Celcoin.
-   * Safe to call multiple times — Celcoin will upsert by myId.
-   */
   async registerCustomer(customer: {
     id: string;
     name: string;
@@ -132,19 +121,12 @@ export const CelcoinService = {
     return res.data;
   },
 
-
-  /**
-   * Creates a monthly Credit Card subscription.
-   * - First charge: today (debited immediately)
-   * - Celcoin automatically debits the card every month
-   */
   async subscribeCreditCard(
     customerId: string,
     amountInCents: number,
     orderId: string,
     card: CardData,
     planGalaxPayId?: number,
-    firstAmount?: number,
     firstPayDayDate?: string
   ) {
     const token = await getAccessToken();
@@ -163,22 +145,11 @@ export const CelcoinService = {
         Card: {
           number: card.number.replace(/\s/g, ''),
           holder: card.holderName,
-          expiresAt,                 // 'YYYY-MM' format
+          expiresAt,
           cvv: card.cvv,
         },
       },
     };
-
-    // Support for pro-rata: if firstAmount is different from amountInCents
-    if (firstAmount && firstAmount !== amountInCents) {
-      payload.Transactions = [
-        {
-          value: firstAmount,
-          paydayDate: today(),
-          myId: `TRX_UPGRADE_${orderId}`
-        }
-      ];
-    }
 
     const res = await celcoinApi.post('/subscriptions', payload, { headers: authHeaders(token) });
 
@@ -190,14 +161,8 @@ export const CelcoinService = {
     };
   },
 
-  /**
-   * Creates a subscription without providing credit card data.
-   * Used for plan changes — Celcoin returns a payment link to enter card details.
-   * Pro-rata logic: the first transaction can have a different value than the recurring one.
-   */
   async subscribeWithoutCard(
     customer: any,
-    proRataAmount: number,
     fullAmountInCents: number,
     orderId: string,
     paymentMethodId: string,
@@ -224,13 +189,6 @@ export const CelcoinService = {
         document: customer.cpf.replace(/\D/g, ''),
         emails: [customer.email],
       },
-      Transactions: [
-        {
-          myId: `TR_UPGRADE_1_${orderId}`,
-          value: proRataAmount,
-          paydayDate: today()
-        }
-      ]
     };
 
     if (customer.address) {
@@ -256,11 +214,68 @@ export const CelcoinService = {
     };
   },
 
-  /**
-   * Creates a monthly Boleto subscription.
-   * Returns boleto PDF, bank line, and payment page from the first transaction.
-   * Field path: Subscription.Transactions[0].Boleto
-   */
+  async createProratedCharge(
+    customer: any,
+    amountInCents: number,
+    orderId: string,
+    paymentMethodId: string,
+    card?: CardData
+  ): Promise<{ chargeId: string; paymentLink?: string; boletoData?: any }> {
+    const token = await getAccessToken();
+    const normalizedMethod = paymentMethodId === 'credit_card' ? 'creditcard' : paymentMethodId;
+
+    const payload: any = {
+      myId: `CHARGE_PRORATA_${orderId}`,
+      value: amountInCents,
+      mainPaymentMethodId: normalizedMethod,
+      payday: today(),
+      Customer: {
+        myId: customer.id,
+        name: customer.name,
+        document: customer.cpf.replace(/\D/g, ''),
+        emails: [customer.email],
+      },
+    };
+
+    if (customer.address) {
+      const addr = typeof customer.address === 'string' ? JSON.parse(customer.address) : customer.address;
+      payload.Customer.Address = {
+        zipCode: addr.zipCode.replace(/\D/g, ''),
+        street: addr.street,
+        number: addr.number,
+        neighborhood: addr.neighborhood,
+        city: addr.city,
+        state: addr.state,
+        complement: addr.complement ?? '',
+      };
+    }
+
+    if (normalizedMethod === 'creditcard' && card) {
+      payload.PaymentMethodCreditCard = {
+        Card: {
+          number: card.number.replace(/\s/g, ''),
+          holder: card.holderName,
+          expiresAt: parseExpiresAt(card.month, card.year),
+          cvv: card.cvv,
+        },
+      };
+    }
+
+    let res: any;
+    try {
+      res = await celcoinApi.post('/charges', payload, { headers: authHeaders(token) });
+    } catch (err: any) {
+      throw err;
+    }
+    const charge = res.data?.Charge ?? res.data?.charge ?? res.data;
+
+    return {
+      chargeId: charge?.galaxPayId?.toString() ?? `CHARGE_PRORATA_${orderId}`,
+      paymentLink: charge?.paymentLink ?? undefined,
+      boletoData: charge?.Boleto ?? undefined,
+    };
+  },
+
   async subscribeBoleto(customerId: string, amountInCents: number, orderId: string, planGalaxPayId?: number, firstPayDayDate?: string) {
     const token = await getAccessToken();
 
@@ -287,9 +302,6 @@ export const CelcoinService = {
     };
   },
 
-  /**
-   * Cancels a subscription in Celcoin.
-   */
   async cancelSubscription(subscriptionId: string) {
     const token = await getAccessToken();
 
@@ -300,9 +312,6 @@ export const CelcoinService = {
     return res.data;
   },
 
-  /**
-   * Updates the credit card of an existing subscription.
-   */
   async updateSubscriptionCard(subscriptionId: string, card: CardData) {
     const token = await getAccessToken();
     const expiresAt = parseExpiresAt(card.month, card.year);
@@ -321,15 +330,12 @@ export const CelcoinService = {
     return res.data;
   },
 
-  /**
-   * Updates the credit card of a SPECIFIC failed transaction and triggers a new payment attempt.
-   */
   async updateTransactionCard(transactionId: string, card: CardData) {
     const token = await getAccessToken();
     const expiresAt = parseExpiresAt(card.month, card.year);
 
     const res = await celcoinApi.put(`/transactions/${transactionId}/galaxPayId`, {
-      paydayDate: today(), // Forces immediate reprocessing
+      paydayDate: today(),
       PaymentMethodCreditCard: {
         Card: {
           number: card.number.replace(/\s/g, ''),
@@ -343,22 +349,25 @@ export const CelcoinService = {
     return res.data;
   },
 
-  /**
-   * Fetches subscription details + ALL transactions via dedicated /transactions endpoint.
-   * The /subscriptions endpoint only embeds a limited set of transactions; the dedicated
-   * /transactions endpoint with subscriptionGalaxPayIds filter returns the full history.
-   */
+  async getCharge(chargeGalaxPayId: string) {
+    const token = await getAccessToken();
+    const res = await celcoinApi.get(`/charges?galaxPayIds=${chargeGalaxPayId}&startAt=0&limit=1`, {
+      headers: authHeaders(token),
+    });
+    const charge = res.data?.Charges?.[0] ?? res.data?.charges?.[0] ?? null;
+    return charge;
+  },
+
   async getSubscriptionPaymentInfo(subscriptionId: string) {
     const token = await getAccessToken();
 
-    // Fetch subscription metadata and all transactions in parallel
     const [subRes, trxRes] = await Promise.all([
       celcoinApi.get(`/subscriptions?galaxPayIds=${subscriptionId}&startAt=0&limit=1`, {
         headers: authHeaders(token)
       }),
       celcoinApi.get(`/transactions?subscriptionGalaxPayIds=${subscriptionId}&startAt=0&limit=100`, {
         headers: authHeaders(token)
-      }).catch(() => null), // graceful fallback if endpoint unavailable
+      }).catch(() => null),
     ]);
 
     const sub = subRes.data?.Subscriptions?.[0];
@@ -374,13 +383,11 @@ export const CelcoinService = {
       'paid', 'payedBoleto', 'payedPix', 'payedCreditCard', 'confirmed',
     ]);
 
-    // Prefer dedicated /transactions response (full history); fall back to embedded ones
     const rawTransactions: any[] =
       trxRes?.data?.Transactions?.length
         ? trxRes.data.Transactions
         : (sub?.Transactions ?? []);
 
-    // Sort: pending first, then by paydayDate desc
     const sorted = [...rawTransactions].sort((a, b) => {
       const aPending = pendingStatuses.has(a.status) ? 0 : 1;
       const bPending = pendingStatuses.has(b.status) ? 0 : 1;
@@ -395,7 +402,7 @@ export const CelcoinService = {
       isPaid: paidStatuses.has(t.status),
       value: t.value,
       paydayDate: t.paydayDate,
-	  payday: t.payday,
+      payday: t.payday,
       boleto: t.Boleto ? {
         pdf: t.Boleto.pdf,
         bankLine: t.Boleto.bankLine,
@@ -407,10 +414,8 @@ export const CelcoinService = {
       } : null,
     });
 
-    // All transactions for full history display
     const allTransactions = sorted.map(mapTransaction);
 
-    // Primary = first pending, for legacy fields
     const primaryRaw =
       rawTransactions.find((t: any) => pendingStatuses.has(t.status))
       ?? rawTransactions[0];

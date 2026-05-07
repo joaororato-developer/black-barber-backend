@@ -13,7 +13,6 @@ const setRefreshCookie = (res: Response, token: string) => {
 };
 
 export const AuthController = {
-  /** POST /api/auth/register — admin only, protected by requireMasterKey */
   async register(req: Request, res: Response) {
     try {
       const { email, password } = req.body;
@@ -35,12 +34,10 @@ export const AuthController = {
 
       return res.status(201).json({ user: newUser });
     } catch (error) {
-      console.error(error);
       return res.status(500).json({ error: 'Internal server error' });
     }
   },
 
-  /** POST /api/auth/login — admin login (email + password) */
   async login(req: Request, res: Response) {
     try {
       const { email, password } = req.body;
@@ -61,12 +58,10 @@ export const AuthController = {
         access_token: accessToken,
       });
     } catch (error) {
-      console.error(error);
       return res.status(500).json({ error: 'Internal server error' });
     }
   },
 
-  /** POST /api/auth/refresh */
   async refresh(req: Request, res: Response) {
     try {
       const refreshToken = req.cookies.refresh_token;
@@ -83,12 +78,10 @@ export const AuthController = {
         return res.status(403).json({ error: 'Invalid refresh token' });
       }
     } catch (error) {
-      console.error(error);
       return res.status(500).json({ error: 'Internal server error' });
     }
   },
 
-  /** POST /api/auth/logout */
   async logout(_req: Request, res: Response) {
     res.clearCookie('refresh_token');
     return res.json({ message: 'Logged out successfully' });

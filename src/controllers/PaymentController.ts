@@ -6,9 +6,6 @@ import { CardService } from '../services/CardService';
 
 import { AuthRequest } from '../middlewares/auth';
 
-/**
- * Helper: fetches the order+customer+plan data needed for payment.
- */
 async function getOrderForPayment(orderId: string) {
   return db('orders')
     .join('customers', 'orders.customer_id', '=', 'customers.id')
@@ -42,22 +39,10 @@ async function getOrderForPayment(orderId: string) {
 }
 
 export const PaymentController = {
-  /**
-   * POST /api/payments/pix
-   * Creates a monthly PIX subscription.
-   * - First QR Code is generated immediately (for today).
-   * - Celcoin automatically generates a new PIX link every month.
-   */
   async payWithPix(req: AuthRequest, res: Response) {
     return res.status(400).json({ error: 'Pagamento via PIX não é mais suportado para assinaturas.' });
   },
 
-  /**
-   * POST /api/payments/credit-card
-   * Creates a monthly Credit Card subscription.
-   * - First charge happens immediately (today).
-   * - Celcoin automatically debits the card every month.
-   */
   async payWithCreditCard(req: AuthRequest, res: Response) {
     try {
       const { orderId, card } = req.body;
@@ -80,7 +65,6 @@ export const PaymentController = {
         whatsapp: order.whatsapp,
       });
 
-      // Load upsells from order_upsells table
       const orderUpsells = await db('order_upsells')
         .join('upsells', 'order_upsells.upsell_id', '=', 'upsells.id')
         .where('order_upsells.order_id', orderId)
@@ -93,39 +77,27 @@ export const PaymentController = {
       let result;
 
       if (order.celcoin_charge_id) {
-        console.log(`[PaymentController] Updating existing subscription ${order.celcoin_charge_id} for order ${orderId}`);
-
-        // 1. Update the main subscription card (for future charges)
         await CelcoinService.updateSubscriptionCard(order.celcoin_charge_id, card);
 
-        // 2. Fetch current payment info to get the specific failed transaction ID
         let subInfo = await CelcoinService.getSubscriptionPaymentInfo(order.celcoin_charge_id);
 
-        // 3. If there's an active/failed transaction, update its card too to trigger an IMMEDIATE retry
         if (subInfo.transactionId) {
-          console.log(`[PaymentController] Triggering immediate retry for transaction ${subInfo.transactionId}`);
           try {
             const updateTxRes = await CelcoinService.updateTransactionCard(subInfo.transactionId, card);
 
-            // The Celcoin API charges immediately on PUT and returns the charge status.
-            // We overwrite subInfo.status with the real-time attempt status:
             if (updateTxRes?.Transaction?.status) {
               subInfo.status = updateTxRes.Transaction.status;
             }
           } catch (err: any) {
-            console.error('[PaymentController] Error reprocessing transaction:', err?.response?.data || err.message);
-            // In case of API error, we force the status to be handled in the check below
             subInfo.status = 'denied';
           }
         }
 
         result = {
           subscriptionId: order.celcoin_charge_id,
-          // Map to 'active' if payment passed, or 'inactive' if failed, for compatibility
           status: (subInfo.status === 'payedCreditCard' || subInfo.status === 'paid' || subInfo.status === 'active') ? 'active' : 'inactive'
         };
       } else {
-        // Create recurring monthly subscription via credit card
         result = await CelcoinService.subscribeCreditCard(
           order.customer_id,
           totalCents,
@@ -144,7 +116,6 @@ export const PaymentController = {
         return res.status(400).json({ error: 'As informações do cartão de crédito estão incorretas ou o pagamento foi recusado. Por favor, verifique os dados e tente novamente. Se o erro persistir, entre em contato com a sua operadora de cartão.' });
       }
 
-      // Save card securely for future plan changes
       await CardService.saveCard(order.customer_id, card);
 
       const paymentStatus = result.status === 'active' ? 'confirmed' : 'analysing';
@@ -174,17 +145,10 @@ export const PaymentController = {
 
       return res.json({ subscriptionId: result.subscriptionId, status: result.status });
     } catch (error: any) {
-      console.error('[PaymentController.payWithCreditCard]', error?.response?.data ?? error);
       return res.status(500).json({ error: 'Failed to create credit card subscription' });
     }
   },
 
-  /**
-   * POST /api/payments/boleto
-   * Creates a monthly Boleto subscription.
-   * - Celcoin generates the boleto immediately.
-   * - quantity=3 (loyalty period)
-   */
   async payWithBoleto(req: AuthRequest, res: Response) {
     try {
       const { orderId, address } = req.body;
@@ -200,12 +164,9 @@ export const PaymentController = {
       }
 
       if (order.celcoin_charge_id) {
-        console.log(`[PaymentController.payWithBoleto] Retrying payment for order ${orderId}. Cancelling old sub ${order.celcoin_charge_id}`);
         try {
           await CelcoinService.cancelSubscription(order.celcoin_charge_id);
-        } catch (e) {
-          console.warn(`[PaymentController.payWithBoleto] Could not cancel old sub ${order.celcoin_charge_id}:`, e);
-        }
+        } catch (e) {}
       }
 
       let finalAddress = address;
@@ -229,7 +190,6 @@ export const PaymentController = {
           return res.status(400).json({ error: 'Endereço completo é obrigatório para pagamento via boleto.' });
         }
 
-        // Save new address to customer record
         await db('customers').where({ id: order.customer_id }).update({
           zip_code: finalAddress.zipCode.replace(/\D/g, ''),
           street: finalAddress.street,
@@ -242,7 +202,6 @@ export const PaymentController = {
         });
       }
 
-      // Register customer in Celcoin with address
       await CelcoinService.registerCustomer({
         id: order.customer_id,
         name: order.name,
@@ -260,7 +219,6 @@ export const PaymentController = {
         },
       });
 
-      // Load upsells from order_upsells table
       const orderUpsells = await db('order_upsells')
         .join('upsells', 'order_upsells.upsell_id', '=', 'upsells.id')
         .where('order_upsells.order_id', orderId)
@@ -298,17 +256,10 @@ export const PaymentController = {
         boletoPage: subData.boletoPage,
       });
     } catch (error: any) {
-      console.error('[PaymentController.payWithBoleto]', error?.response?.data ?? error);
       return res.status(500).json({ error: 'Failed to create boleto subscription' });
     }
   },
 
-  /**
-   * POST /webhook/celcoin
-   * Celcoin fires this when a transaction status changes (paid, canceled, etc).
-   * Handles both one-time charges and subscription transactions.
-   * Must return 200 immediately to stop retries.
-   */
   async webhook(req: Request, res: Response) {
     try {
       res.status(200).send('OK');
@@ -319,19 +270,13 @@ export const PaymentController = {
       const oldSystemUrl = 'https://api.cashbarber.com.br/api/blackbarber/galaxpay/webhook';
       setImmediate(() => {
         const headersToForward = { ...req.headers };
-        
-        // Remova cabeçalhos de controle que podem causar problemas no destino
         delete headersToForward['host'];
         delete headersToForward['content-length'];
         delete headersToForward['connection'];
 
-        console.log('[Webhook Forwarder] Repassando requisição original para sistema antigo...');
-
         axios.post(oldSystemUrl, req.body, {
           headers: headersToForward
-        }).catch(err => {
-          console.warn('[Webhook Forwarder] O sistema antigo falhou:', err.response?.data || err.message);
-        });
+        }).catch(() => {});
       });
 
       if (!event) return;
@@ -348,10 +293,7 @@ export const PaymentController = {
         if (!subscriptionId) return;
 
         const order = await db('orders').where({ celcoin_charge_id: subscriptionId }).first();
-        if (!order) {
-          console.warn(`[Celcoin Webhook] No order found for subscriptionId=${subscriptionId}`);
-          return;
-        }
+        if (!order) return;
 
         let payment_status: string;
         let order_status: string;
@@ -386,7 +328,6 @@ export const PaymentController = {
       }
 
     } catch (err) {
-      console.error('[Celcoin Webhook] Error processing:', err);
     }
   },
 };
