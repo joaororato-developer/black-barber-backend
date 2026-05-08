@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import db from '../database/connection';
 import { CheckoutRequest } from '../middlewares/checkoutAuth';
 import { CelcoinService } from '../services/CelcoinService';
+import { MailService } from '../services/MailService';
 
 function extractIp(req: Request): string {
   return (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim()
@@ -126,6 +127,77 @@ export const OrderController = {
     }
   },
 
+  async getAdminInvoices(req: Request, res: Response) {
+    try {
+      const { id } = req.params;
+      const order = await db('orders').where({ id }).first();
+      if (!order) return res.status(404).json({ error: 'Order not found' });
+
+      const pendingStatuses = new Set([
+        'pending', 'pendingBoleto', 'pendingPix', 'pendingCreditCard',
+        'waitingPayment', 'notSend', 'denied', 'waitingBoleto', 'waitingPix',
+      ]);
+      const paidStatuses = new Set([
+        'paid', 'payedBoleto', 'payedPix', 'payedCreditCard', 'confirmed',
+      ]);
+
+      const nowParts = new Intl.DateTimeFormat('pt-BR', {
+        timeZone: 'America/Sao_Paulo', year: 'numeric', month: '2-digit', day: '2-digit'
+      }).formatToParts(new Date());
+      const todayStr = `${nowParts.find(p => p.type === 'year')!.value}-${nowParts.find(p => p.type === 'month')!.value}-${nowParts.find(p => p.type === 'day')!.value}`;
+
+      let paymentMethod: string | null = null;
+      const allTransactions: any[] = [];
+
+      if (order.celcoin_charge_id) {
+        try {
+          const info = await CelcoinService.getSubscriptionPaymentInfo(order.celcoin_charge_id);
+          paymentMethod = info.paymentMethod;
+          for (const t of info.transactions) {
+            allTransactions.push({ ...t, isProrated: false });
+          }
+        } catch { /* ignore */ }
+      }
+
+      if (order.celcoin_prorated_charge_id) {
+        try {
+          const charge = await CelcoinService.getCharge(order.celcoin_prorated_charge_id);
+          if (charge) {
+            allTransactions.push({
+              transactionId: charge.galaxPayId?.toString() ?? null,
+              status: charge.status,
+              isPending: pendingStatuses.has(charge.status),
+              isPaid: paidStatuses.has(charge.status),
+              isProrated: true,
+              value: charge.value,
+              paydayDate: charge.paydayDate ?? null,
+              payday: charge.payday ?? null,
+              boleto: charge.Boleto ? {
+                pdf: charge.Boleto.pdf ?? null,
+                bankLine: charge.Boleto.bankLine ?? null,
+                paymentPage: charge.Boleto.page ?? null,
+              } : null,
+              pix: charge.Pix ? {
+                qrCode: charge.Pix.qrCode ?? null,
+                paymentLink: charge.Pix.paymentLink ?? null,
+              } : null,
+            });
+          }
+        } catch { /* ignore */ }
+      }
+
+      const isOverdue = allTransactions.some(t => {
+        if (!t.isPending) return false;
+        const date = t.paydayDate || t.payday;
+        return date && date < todayStr;
+      });
+
+      return res.json({ paymentMethod, isOverdue, transactions: allTransactions });
+    } catch (error) {
+      return res.status(500).json({ error: 'Internal server error' });
+    }
+  },
+
   async index(req: Request, res: Response) {
     try {
       const { name, date, paymentStatus, erpStatus } = req.query;
@@ -143,6 +215,7 @@ export const OrderController = {
           'orders.payment_type',
           'orders.payment_status',
           'orders.order_status',
+          'orders.celcoin_charge_id',
           'orders.created_at',
           'orders.updated_at'
         );
@@ -186,6 +259,7 @@ export const OrderController = {
         paymentMethod: o.payment_type,
         paymentStatus: o.payment_status,
         erpStatus: o.order_status === 'payment_pending' || o.order_status === 'pending' ? 'pending' : o.order_status,
+        celcoinChargeId: o.celcoin_charge_id ?? null,
         createdAt: o.created_at,
         updatedAt: o.updated_at
       }));
@@ -199,18 +273,29 @@ export const OrderController = {
   async updateERPStatus(req: Request, res: Response) {
     try {
       const { id } = req.params;
-      const { erp_status } = req.body;
+      const { erp_status, password, email } = req.body;
 
       if (!erp_status || !['pending', 'registered'].includes(erp_status)) {
         return res.status(400).json({ error: 'Invalid ERP status' });
       }
 
-      const updateCount = await db('orders')
+      const order = await db('orders')
+        .join('customers', 'orders.customer_id', '=', 'customers.id')
+        .select('orders.id', 'customers.name', 'customers.email')
+        .where('orders.id', id)
+        .first();
+
+      if (!order) {
+        return res.status(404).json({ error: 'Order not found' });
+      }
+
+      await db('orders')
         .where({ id })
         .update({ order_status: erp_status, status_updated_at: db.fn.now(), updated_at: db.fn.now() });
 
-      if (updateCount === 0) {
-        return res.status(404).json({ error: 'Order not found' });
+      if (erp_status === 'registered') {
+        const sendTo = (email as string | undefined) || order.email;
+        MailService.sendWelcomeEmail(sendTo, order.name, password ?? null).catch(() => undefined);
       }
 
       return res.json({ message: 'ERP status updated properly' });

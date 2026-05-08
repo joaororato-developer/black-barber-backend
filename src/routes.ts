@@ -44,6 +44,7 @@ routes.get('/api/auth/me', requireAuth, (req, res) => {
 });
 routes.post('/api/auth/logout', requireAuth, AuthController.logout);
 routes.get('/api/orders', requireAdmin, OrderController.index);
+routes.get('/api/orders/:id/invoices', requireAdmin, OrderController.getAdminInvoices);
 routes.patch('/api/orders/:id/erp-status', requireAdmin, OrderController.updateERPStatus);
 
 export default routes;
