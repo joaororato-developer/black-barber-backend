@@ -74,5 +74,45 @@ export const MailService = {
     } catch (error) {
       throw new Error('Falha no envio de e-mail');
     }
-  }
+  },
+
+  async sendDataDeletionAlert(customer: { name: string; email: string; cpf: string }) {
+    const requestedAt = new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+    const adminEmail = process.env.ADMIN_EMAIL || process.env.SMTP_FROM;
+
+    const html = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; color: #333;">
+        <h2 style="color: #cc0000;">[LGPD] Solicitação de Exclusão de Dados</h2>
+        <p>Um cliente solicitou a exclusão de seus dados pessoais conforme o Art. 18, IV da LGPD.</p>
+        <table style="width: 100%; border-collapse: collapse; margin-top: 16px;">
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background: #f5f5f5;">Nome</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${customer.name}</td>
+          </tr>
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background: #f5f5f5;">E-mail</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${customer.email}</td>
+          </tr>
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background: #f5f5f5;">CPF</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${customer.cpf}</td>
+          </tr>
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background: #f5f5f5;">Data/Hora</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${requestedAt}</td>
+          </tr>
+        </table>
+        <p style="margin-top: 20px; color: #666; font-size: 13px;">
+          O prazo legal para resposta é de <strong>15 dias úteis</strong>. Cancele a assinatura e exclua os dados do cliente no sistema e na Celcoin.
+        </p>
+      </div>
+    `;
+
+    await transporter.sendMail({
+      from: `Black Barber <${process.env.SMTP_FROM}>`,
+      to: adminEmail!,
+      subject: `[LGPD] Solicitação de exclusão de dados — ${customer.name}`,
+      html,
+    });
+  },
 };

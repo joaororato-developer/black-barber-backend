@@ -29,11 +29,11 @@ routes.post('/api/customer/auth/verify-code', CustomerAuthController.verifyCode)
 routes.get('/api/customer/me', requireCustomer, CustomerController.getProfile);
 routes.post('/api/customer/me/request-email-change', requireCustomer, CustomerController.requestEmailChange);
 routes.put('/api/customer/me', requireCustomer, CustomerController.updateProfile);
+routes.post('/api/customer/me/request-data-deletion', requireCustomer, CustomerController.requestDataDeletion);
 
 routes.get('/api/customer/subscriptions', requireCustomer, SubscriptionController.list);
 routes.get('/api/customer/subscriptions/:id/payment', requireCustomer, SubscriptionController.getPaymentInfo);
 routes.post('/api/customer/subscriptions/:id/change-plan', requireCustomer, SubscriptionController.changePlan);
-routes.post('/api/customer/subscriptions/:id/change-payment-method', requireCustomer, SubscriptionController.changePaymentMethod);
 
 routes.post('/api/payments/pix', requireCustomer, PaymentController.payWithPix);
 routes.post('/api/payments/credit-card', requireCustomer, PaymentController.payWithCreditCard);

@@ -156,7 +156,7 @@ export const SubscriptionController = {
       }
 
       const newPlanPrice = planDB.price_cents;
-      const newTotalMonthlyPrice = newPlanPrice + (eyebrowUpsell?.price_cents ?? 0);
+      const newTotalMonthlyPrice = newPlanPrice + (newAdditionalEyebrow ? (eyebrowUpsell?.price_cents ?? 0) : 0);
 
       const isDowngrade = newTotalMonthlyPrice < currentTotalMonthlyPriceSubscription;
 
@@ -211,7 +211,6 @@ export const SubscriptionController = {
 
         const difference = newTotalMonthlyPrice - currentTotalMonthlyPriceSubscription;
         amountToChargeNow = Math.round(difference * (remainingDays / 30));
-        if (amountToChargeNow < 100) amountToChargeNow = 100;
 
         const todayDay = todayDate.getDate();
         const nextMonthDate = new Date(todayDate.getFullYear(), todayDate.getMonth() + 1, 1);
@@ -264,7 +263,7 @@ export const SubscriptionController = {
           );
         }
 
-        if (!isDowngrade) {
+        if (!isDowngrade && amountToChargeNow > 0) {
           const chargeResult = await CelcoinService.createProratedCharge(
             customer,
             amountToChargeNow,
@@ -277,12 +276,12 @@ export const SubscriptionController = {
             .update({ celcoin_prorated_charge_id: chargeResult.chargeId });
         }
 
-        const isAutoPaid = (subData as any).status === 'active';
+        const isAutoPaid = (subData as any).status === 'active' || (!isDowngrade && amountToChargeNow === 0);
 
         if (currentSub.celcoin_subscription_id) {
           try {
             await CelcoinService.cancelSubscription(currentSub.celcoin_subscription_id);
-          } catch (err: any) {}
+          } catch (err: any) { }
         }
 
         await trx('subscriptions').where({ id: currentSub.id }).update({
@@ -334,112 +333,6 @@ export const SubscriptionController = {
 
     } catch (error: any) {
       return res.status(500).json({ error: 'Internal server error' });
-    }
-  },
-
-  async changePaymentMethod(req: AuthRequest, res: Response) {
-    try {
-      const userId = req.userId;
-      const subscriptionId = req.params.id;
-      const { newPaymentMethod, address } = req.body;
-
-      if (!['credit_card', 'pix', 'boleto'].includes(newPaymentMethod)) {
-        return res.status(400).json({ error: 'Método de pagamento inválido.' });
-      }
-
-      let customer = await db('customers').where({ user_id: userId }).first();
-      if (!customer) return res.status(404).json({ error: 'Cliente não encontrado.' });
-
-      if (address) {
-        const addr = typeof address === 'string' ? JSON.parse(address) : address;
-        await db('customers').where({ id: customer.id }).update({
-          zip_code: addr.zipCode?.replace(/\D/g, '') ?? addr.zip_code,
-          street: addr.street,
-          street_number: addr.number ?? addr.street_number,
-          neighborhood: addr.neighborhood,
-          city: addr.city,
-          state: addr.state,
-          complement: addr.complement ?? null,
-          updated_at: new Date()
-        });
-        customer = await db('customers').where({ id: customer.id }).first();
-      }
-
-      const subscription = await db('subscriptions')
-        .where({ id: subscriptionId, customer_id: customer.id })
-        .first();
-
-      if (!subscription) return res.status(404).json({ error: 'Assinatura não encontrada.' });
-
-      const order = await db('orders').where({ id: subscription.order_id }).first();
-      if (!order) return res.status(404).json({ error: 'Pedido não encontrado.' });
-
-      if (subscription.payment_status === 'paid' || subscription.payment_status === 'confirmed') {
-        return res.status(400).json({ error: 'Este pagamento já foi confirmado e não pode ser alterado.' });
-      }
-
-      if (subscription.celcoin_subscription_id) {
-        try {
-          await CelcoinService.cancelSubscription(subscription.celcoin_subscription_id);
-        } catch (err: any) {}
-      }
-
-      const planDB = await db('plans').where({ name: order.plan }).first();
-      if (!planDB) return res.status(404).json({ error: 'Plano não encontrado no banco de dados.' });
-
-      const celcoinPlanId = newPaymentMethod === 'credit_card'
-        ? planDB.celcoin_plan_id_credit_card
-        : planDB.celcoin_plan_id_pix;
-
-      const uniqueOrderId = `${order.id}_${Date.now()}`;
-
-      if (newPaymentMethod !== 'credit_card' && !customer.zip_code) {
-        return res.status(400).json({ error: 'ADDRESS_REQUIRED', message: 'Endereço é obrigatório para pagamento via Boleto ou PIX.' });
-      }
-
-      const customerWithAddress = {
-        ...customer,
-        address: customer.zip_code ? {
-          zipCode: customer.zip_code,
-          street: customer.street,
-          number: customer.street_number,
-          neighborhood: customer.neighborhood,
-          city: customer.city,
-          state: customer.state,
-          complement: customer.complement,
-        } : undefined,
-      };
-
-      const subData = await CelcoinService.subscribeWithoutCard(
-        customerWithAddress,
-        order.price_cents,
-        uniqueOrderId,
-        newPaymentMethod,
-        celcoinPlanId
-      );
-
-      await db.transaction(async (trx) => {
-        await trx('orders').where({ id: order.id }).update({
-          payment_type: newPaymentMethod,
-          celcoin_charge_id: subData.subscriptionId,
-          updated_at: new Date()
-        });
-
-        await trx('subscriptions').where({ id: subscription.id }).update({
-          celcoin_subscription_id: subData.subscriptionId,
-          payment_link: subData.paymentLink,
-          updated_at: new Date()
-        });
-      });
-
-      return res.json({
-        message: 'Forma de pagamento alterada com sucesso!',
-        paymentMethod: newPaymentMethod,
-        paymentLink: subData.paymentLink
-      });
-
-    } catch (error: any) {
-      return res.status(500).json({ error: 'Erro ao alterar forma de pagamento.' });
     }
   },
 
@@ -506,7 +399,7 @@ export const SubscriptionController = {
             };
             paymentInfo.transactions = [chargeTransaction, ...paymentInfo.transactions];
           }
-        } catch (err: any) {}
+        } catch (err: any) { }
       }
 
       return res.json(paymentInfo);

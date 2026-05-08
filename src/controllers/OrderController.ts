@@ -3,14 +3,25 @@ import db from '../database/connection';
 import { CheckoutRequest } from '../middlewares/checkoutAuth';
 import { CelcoinService } from '../services/CelcoinService';
 
+function extractIp(req: Request): string {
+  return (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim()
+    ?? (req.socket as any)?.remoteAddress
+    ?? req.ip
+    ?? 'unknown';
+}
+
 export const OrderController = {
   async createOrder(req: CheckoutRequest, res: Response) {
     try {
       const customerId = req.checkoutCustomerId;
-      const { plan, additionalEyebrow, paymentType } = req.body;
+      const { plan, additionalEyebrow, paymentType, consentText, consentVersion } = req.body;
 
       if (!customerId || !plan || !paymentType) {
         return res.status(400).json({ error: 'Missing required payload fields' });
+      }
+
+      if (!consentText || !consentVersion) {
+        return res.status(400).json({ error: 'Consentimento obrigatório.' });
       }
 
       const activeSubscription = await db('subscriptions')
@@ -23,6 +34,9 @@ export const OrderController = {
           error: 'Você já possui uma assinatura vinculada a esta conta. Para alterar seu plano ou forma de pagamento, acesse o painel "Minha Conta".'
         });
       }
+
+      const ip = extractIp(req);
+      const userAgent = req.headers['user-agent'] ?? null;
 
       const existingOrder = await db('orders')
         .where({
@@ -45,6 +59,15 @@ export const OrderController = {
             await db('order_upsells').insert({ order_id: existingOrder.id, upsell_id: upsell.id });
           }
         }
+
+        await db('consent_logs').insert({
+          customer_id: customerId,
+          order_id: existingOrder.id,
+          consent_version: consentVersion,
+          consent_text: consentText,
+          ip_address: ip,
+          user_agent: userAgent,
+        });
 
         return res.status(200).json({
           message: 'Existing pending order updated and returned',
@@ -83,6 +106,15 @@ export const OrderController = {
           loyalty_months: loyaltyMonths,
           loyalty_until: loyaltyUntil,
           payment_status: 'pending',
+        });
+
+        await trx('consent_logs').insert({
+          customer_id: customerId,
+          order_id: order.id,
+          consent_version: consentVersion,
+          consent_text: consentText,
+          ip_address: ip,
+          user_agent: userAgent,
         });
 
         return order.id;

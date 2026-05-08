@@ -124,5 +124,31 @@ export const CustomerController = {
     } catch (error) {
       return res.status(500).json({ error: 'Internal server error' });
     }
-  }
+  },
+
+  async requestDataDeletion(req: AuthRequest, res: Response) {
+    try {
+      const userId = req.userId;
+      if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+      const customer = await db('customers').where({ user_id: userId }).first();
+      if (!customer) return res.status(404).json({ error: 'Cliente não encontrado.' });
+
+      const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim()
+        ?? (req.socket as any)?.remoteAddress
+        ?? req.ip
+        ?? 'unknown';
+
+      await db('data_deletion_requests').insert({
+        customer_id: customer.id,
+        ip_address: ip,
+      });
+
+      await MailService.sendDataDeletionAlert(customer);
+
+      return res.json({ message: 'Solicitação registrada. Entraremos em contato em até 15 dias úteis.' });
+    } catch (error) {
+      return res.status(500).json({ error: 'Erro interno ao registrar solicitação.' });
+    }
+  },
 };

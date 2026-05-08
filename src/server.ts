@@ -11,6 +11,8 @@ dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
 const app = express();
 
+app.set('trust proxy', 1);
+
 app.use(helmet());
 
 app.use(cors({
